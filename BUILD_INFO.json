@@ -1,0 +1,13 @@
+{
+  "product": "ARTEMIS R69",
+  "version": "6.0.0",
+  "buildDate": "2026-11-14",
+  "codename": "ORION",
+  "target": "SHUNJUEY R69-EMCP V2.0 / Allwinner H3",
+  "analysisMode": "read-only-by-default",
+  "felWrite": false,
+  "felExec": false,
+  "persistentRecoveryBuilder": false,
+  "sourceProject": "Chibani-Lol-AI-main.zip",
+  "notes": "New safe architecture; legacy active flashing workflow is not carried forward."
+}

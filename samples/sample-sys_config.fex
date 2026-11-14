@@ -1,0 +1,13 @@
+[product]
+machine = "dolphin-p1"
+
+[dram_para]
+dram_clk = 336
+dram_type = 7
+dram_zq = 0x3939f9
+dram_para1 = 0x10E40000
+dram_para2 = 0x0000
+dram_tpr0 = 0x0048A192
+dram_tpr1 = 0x01C2418D
+dram_tpr2 = 0x00076051
+dram_tpr13 = 0x0D800000

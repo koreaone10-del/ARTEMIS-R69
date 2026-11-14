@@ -1,0 +1,14 @@
+[partition]
+name = bootloader
+size = 65536
+downloadfile = "boot-resource.fex"
+
+[partition]
+name = boot
+size = 65536
+downloadfile = "boot.fex"
+
+[partition]
+name = super
+size = 4194304
+downloadfile = "super.fex"
