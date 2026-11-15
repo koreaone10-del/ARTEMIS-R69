@@ -1,13 +1,12 @@
 {
-  "product": "ARTEMIS R69",
-  "version": "6.0.0",
-  "buildDate": "2026-11-14",
-  "codename": "ORION",
-  "target": "SHUNJUEY R69-EMCP V2.0 / Allwinner H3",
-  "analysisMode": "read-only-by-default",
+  "name": "ARTEMIS R69 ORION",
+  "version": "6.1.0",
+  "build": "IMAGEWTY-V3-PARSER-CORRECTION",
+  "mode": "READ_ONLY",
+  "firmwareProcessing": "LOCAL_BROWSER_ONLY",
   "felWrite": false,
   "felExec": false,
-  "persistentRecoveryBuilder": false,
-  "sourceProject": "Chibani-Lol-AI-main.zip",
-  "notes": "New safe architecture; legacy active flashing workflow is not carried forward."
+  "emmcWrite": false,
+  "boot0Patching": false,
+  "imagewtyLayoutSource": "fuxdasec/imagewty-tool include/img_header.h + src/img_header.c"
 }

@@ -14,3 +14,14 @@ These references underpin the design. Vendor-specific details remain marked as u
 
 ## Confidence policy
 A public SoC data sheet is not proof that a specific board routes every peripheral. Reverse-engineered container offsets are candidate formats, not vendor guarantees. The application must show unknowns instead of silently substituting assumptions.
+
+## IMAGEWTY serialized layout reference
+
+The v3 parser layout in 6.1.0 was cross-checked against the public C implementation:
+- `include/img_header.h`: main-header fields, fixed 1024-byte main header, table start `0x400`, serialized file-header struct, minimum field footprint `0x138`.
+- `src/img_header.c`: sequential decoding of `filename_length`, `header_size`, `maintype`, `subtype`, `unknown0`, filename, `stored_length`, padding, `original_length`, padding and payload `offset`; validation of table and payload ranges.
+- `src/img_extract.c`: streaming extraction and V-file checksum verification.
+
+Repository: https://github.com/fuxdasec/imagewty-tool
+
+Important correction: the main-header value at `0x20` is `file_header_length`, not `image_header_size` or the start of the file table. The table starts at `0x400`. The serialized entry layout differs from the previous guessed offsets: filename length at `0x00`, entry header size at `0x04`, maintype at `0x08`, subtype at `0x10`, unknown0 at `0x20`, filename at `0x24`, stored length at `0x124`, original length at `0x12c`, and data offset at `0x134`.

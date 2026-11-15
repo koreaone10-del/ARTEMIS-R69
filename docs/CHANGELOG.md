@@ -1,13 +1,9 @@
 # Changelog
 
-## 6.0.0 — ORION (2026-11-14)
-- Replaced the legacy active flashing workflow with a read-only forensic architecture.
-- Added mobile-first RTL dashboard and browser-local firmware inspection.
-- Added candidate IMAGEWTY v3 parser with bounds checks and explicit uncertainty labels.
-- Added eGON checksum/header validation and conservative TOC1 header inspection.
-- Added FEX DRAM and partition metadata parsers.
-- Added USB descriptor inspector; no FEL protocol transfer is sent.
-- Added Boot Code Studio for source-only drafting/review.
-- Added offline engineering assistant and optional server-side OpenAI-compatible AI proxy.
-- Added JSON reports, Termux scripts, Render deployment, Dockerfile, CI and tests.
-- Removed old active FEL write/execute/flash UI and unsupported recovery-image claims.
+## 6.1.0 — 2026-11-15
+- Corrected IMAGEWTY v3 serialized entry layout against the public C reference implementation.
+- Read `file_header_length` from main-header offset `0x20`; it is not the entry-table offset.
+- Decode filename length, per-entry header size, maintype, subtype, filename, stored/original lengths and payload offset at their actual serialized positions.
+- Restore local per-file extraction using the validated payload range and `original_length`.
+- Added 37-entry synthetic regression coverage, malformed range checks and unsafe-name rejection.
+- Kept all hardware interaction read-only; no FEL write/execute, DRAM pattern, Boot0 patching or eMMC writes.

@@ -1,6 +1,6 @@
 <div align="center">
 
-# ARTEMIS R69 — ORION v6.0
+# ARTEMIS R69 — ORION v6.1
 ### Mobile-first firmware forensics & embedded engineering workspace
 **SHUNJUEY R69-EMCP V2.0 • Allwinner H3 • dolphin-p1**
 
@@ -15,7 +15,7 @@
 ### الوحدات
 
 - **Hardware Intelligence:** طلب صلاحية WebUSB واستعراض descriptors وواجهات USB ونقاط النهاية. لا يدّعي نجاح FEL أو تحديد H3 اعتماداً على VID/PID وحدهما.
-- **Firmware Inspector:** قراءة ترويسة IMAGEWTY وجدول الإدخالات وفق profile مرشح v3، فحص الحدود، وعرض إمكانية استخراج payload محلياً. الملفات لا تُرفع إلى الخادم.
+- **Firmware Inspector:** قراءة ترويسة IMAGEWTY v3 وفق بنية الحقول الفعلية في مرجع C مفتوح المصدر، وفحص 37 مدخلاً/أي عدد معلن، ثم استخراج payload محلياً بعد فحص الاسم والمدى والحجم. الملفات لا تُرفع إلى الخادم.
 - **Bootloader Lab:** فحص eGON magic والطول وchecksum، وعرض ترويسة TOC1 ومكونات R69 المعروفة دون تخمين offsets غير مثبتة.
 - **DRAM Analyzer:** تحليل قيم FEX، مثل `dram_type=7` و`dram_clk=336` و`dram_zq`، مع الفصل بين إعدادات Firmware وقياسات العتاد الحقيقية.
 - **Partition Engineer:** حساب القطاعات والأحجام مع توضيح أن مجموع الأقسام ليس إثباتاً لسعة eMMC.
@@ -29,7 +29,7 @@
 - VID/PID `1F3A:EFE8` يثبت هوية USB التي رُصدت سابقاً فقط، ولا يثبت نجاح FEL handshake.
 - SoC ID المتوقع لـ H3 هو `0x1680`، لكنه لم يُقرأ بعد من الجهاز عبر FEL_VERSION.
 - `dolphin-p1`, LPDDR3 336 MHz و`dram_type=7` هي قيم معلنة في Firmware.
-- IMAGEWTY profile في هذا المشروع موسوم **candidate-v3-profile**. لا تعتمد على offsets قبل مطابقتها بملفات مستخرجة معروفة.
+- IMAGEWTY v3 layout في 6.1.0 مطابق للحقول التي يقرأها المرجع `fuxdasec/imagewty-tool`؛ مع ذلك يجب فحص صحة كل مدى قبل الاستخراج، ولا يوجد ادعاء CRC عام.
 - TOC1 inspector يقرأ header ولا يدّعي تحليل جدول العناصر الداخلي حتى يتم توثيق layout الخاص بهذه الحزمة.
 
 ## تشغيل على Android / Termux
@@ -100,6 +100,10 @@ ARTEMIS_R69_v6/
 ├── render.yaml
 └── BUILD_INFO.json
 ```
+
+## IMAGEWTY v3 layout correction
+
+النسخة السابقة كانت تقرأ مواضع خاطئة داخل كل entry، ولهذا كانت تعرض أسماء/offsets فارغة. في النسخة 6.1.0 تم تصحيحها: `filename_length=0x00`, `header_size=0x04`, `maintype=0x08`, `subtype=0x10`, `unknown0=0x20`, `filename=0x24`, `stored_length=0x124`, `original_length=0x12c`, `offset=0x134`. قيمة الحقل الرئيسي عند `0x20` هي `file_header_length`؛ جدول الملفات يبدأ عند `0x400`. انظر المصدر المرجعي في `docs/RESEARCH_SOURCES.md`.
 
 ## Sources
 انظر [docs/RESEARCH_SOURCES.md](docs/RESEARCH_SOURCES.md) و[docs/DEVICE_PROFILE.md](docs/DEVICE_PROFILE.md). تم الفصل بين ما ورد في مصادر عامة وما تم استخراجه من ملفات الجهاز وما هو مجرد توقع.
