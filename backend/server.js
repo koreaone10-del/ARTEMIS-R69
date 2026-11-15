@@ -3,7 +3,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { URL } = require('node:url');
-const { runAssistant } = require('../lib/ai/assistant');
+const { runAssistant, getAIStatus } = require('../lib/ai/assistant');
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.resolve(__dirname, '..', 'frontend');
 const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.ico':'image/x-icon' };
@@ -21,7 +21,8 @@ function readJson(req, limit=2*1024*1024) {
 }
 async function handler(req,res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{ok:true,app:'ARTEMIS R69',version:'6.1.0',mode:'analysis-only',persistentWrites:false,felExecEnabled:false});
+  if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{ok:true,app:'ARTEMIS R69',version:'6.2.0',mode:'analysis-only',persistentWrites:false,felExecEnabled:false});
+  if (req.method==='GET' && url.pathname==='/api/ai/status') return send(res,200,getAIStatus());
   if (req.method==='GET' && url.pathname==='/api/build') {
     const info=JSON.parse(fs.readFileSync(path.join(ROOT,'..','BUILD_INFO.json'),'utf8')); return send(res,200,info);
   }
@@ -47,5 +48,5 @@ async function handler(req,res) {
   });
 }
 const server=http.createServer((req,res)=>{handler(req,res).catch(e=>send(res,500,{error:'internal_error',message:e.message}));});
-if(require.main===module) server.listen(PORT,'0.0.0.0',()=>console.log(`ARTEMIS R69 v6.1.0 listening on ${PORT}`));
+if(require.main===module) server.listen(PORT,'0.0.0.0',()=>console.log(`ARTEMIS R69 v6.2.0 listening on ${PORT}`));
 module.exports={server,handler};

@@ -1,6 +1,6 @@
 {
   "name": "artemis-r69-v6",
-  "version": "6.1.0",
+  "version": "6.2.0",
   "private": false,
   "description": "Mobile-first, read-only Allwinner H3 R69 firmware analysis with reference-layout IMAGEWTY extraction",
   "main": "backend/server.js",
