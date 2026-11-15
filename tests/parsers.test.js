@@ -71,3 +71,35 @@ test('IMAGEWTY v3 rejects truncated metadata and unsafe filenames',()=>{
   assert.equal(parseImagewtyHeader(b).entries[0].valid,false);
   assert.throws(()=>parseImagewtyHeader(b.subarray(0,800),{fileSize:b.length}));
 });
+
+test('IMAGEWTY accepts safe imgRePacker Windows-style paths', () => {
+  const b = makeImagewtyV3(1);
+  const p = 0x400;
+  const name = 'imgRePacker\\sys_config.fex';
+
+  b.fill(0, p + 0x24, p + 0x24 + 256);
+  b.write(name, p + 0x24, 'ascii');
+  b.writeUInt32LE(256, p);
+
+  const r = parseImagewtyHeader(b);
+
+  assert.equal(r.validEntries, 1);
+  assert.equal(r.invalidEntries, 0);
+  assert.equal(r.entries[0].name, 'imgRePacker/sys_config.fex');
+});
+
+test('IMAGEWTY rejects traversal and unknown directories', () => {
+  const b = makeImagewtyV3(1);
+  const p = 0x400;
+
+  b.write('../escape.fex', p + 0x24, 'ascii');
+  b.writeUInt32LE(13, p);
+
+  assert.equal(parseImagewtyHeader(b).entries[0].valid, false);
+
+  const c = makeImagewtyV3(1);
+  c.write('other/file.fex', p + 0x24, 'ascii');
+  c.writeUInt32LE(15, p);
+
+  assert.equal(parseImagewtyHeader(c).entries[0].valid, false);
+});
