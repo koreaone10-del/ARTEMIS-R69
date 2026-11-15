@@ -1,0 +1,14 @@
+{
+  "name": "ARTEMIS R69 ORION",
+  "version": "6.2.0",
+  "build": "SOURCE_EDITOR_AND_NO_KEY_AI_ENDPOINT",
+  "mode": "READ_ONLY",
+  "firmwareProcessing": "LOCAL_BROWSER_ONLY",
+  "felWrite": false,
+  "felExec": false,
+  "emmcWrite": false,
+  "boot0Patching": false,
+  "imagewtyLayoutSource": "fuxdasec/imagewty-tool include/img_header.h + src/img_header.c",
+  "bootCodeStudio": "LOCAL_SOURCE_EDITOR_EXPORT_ONLY",
+  "ai": "OPENAI_COMPATIBLE_OPTIONAL_NO_KEY_ENDPOINT"
+}
