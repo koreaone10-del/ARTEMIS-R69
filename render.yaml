@@ -8,8 +8,8 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
-        value: 20
+        value: "20"
       - key: AI_BASE_URL
-        value: https://api.openai.com/v1
+        value: https://oai.endpoints.kepler.ai.cloud.ovh.net/v1
       - key: AI_MODEL
-        value: gpt-4o-mini
+        value: gpt-oss-20b
