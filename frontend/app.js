@@ -42,9 +42,10 @@ $('parseFirmware').addEventListener('click',async()=>{
   for(let i=0;i<count;i++){
    const p=i*fileHeaderLength,filenameLength=read32(p),entryHeaderSize=read32(p+4);
    const mainType=textField(p+8,8),subType=textField(p+16,16),unknown0=read32(p+32);
-   const name=filenameLength>=1&&filenameLength<=256?new TextDecoder().decode(table.slice(p+0x24,p+0x24+filenameLength)).replace(/\0+$/g,'').trim():'';
+   const name=filenameLength>=1&&filenameLength<=256?new TextDecoder().decode(table.slice(p+0x24,p+0x24+filenameLength)).split('\0',1)[0].trim().replace(/\\/g,'/'):'';
    const storedLength=read32(p+0x124),pad1=read32(p+0x128),originalLength=read32(p+0x12c),pad2=read32(p+0x130),offset=read32(p+0x134);
-   const safeName=!!name&&name!=='.'&&name!=='..'&&!/[\\/\x00-\x1f\x7f]/.test(name),duplicate=seen.has(name);if(name)seen.add(name);
+   const parts=name.split('/');
+   const safeName=!!name&&!/[\x00-\x1f\x7f]/.test(name)&&!name.startsWith('/')&&!/^[a-zA-Z]:/.test(name)&&(parts.length===1||(parts.length===2&&parts[0]==='imgRePacker'))&&parts.every(x=>x&&x!=='.'&&x!=='..')&&/^[a-zA-Z0-9._-]+$/.test(parts[parts.length-1]),duplicate=seen.has(name);if(name)seen.add(name);
    const end=offset+storedLength,rangeValid=Number.isSafeInteger(end)&&offset>=tableEnd&&originalLength<=storedLength&&end<=f.size;
    const valid=filenameLength>=1&&filenameLength<=256&&safeName&&entryHeaderSize>=0x138&&entryHeaderSize<=fileHeaderLength&&rangeValid&&!duplicate;
    entries.push({index:i,name,filenameLength,entryHeaderSize,mainType,subType,unknown0,storedLength,originalLength,pad1,pad2,offset,inBounds:rangeValid,valid,duplicateName:duplicate,issues:[...(safeName?[]:['invalid filename']),...(entryHeaderSize>=0x138&&entryHeaderSize<=fileHeaderLength?[]:['invalid entry header size']),...(rangeValid?[]:['invalid payload range']),...(duplicate?['duplicate filename']:[])]});
