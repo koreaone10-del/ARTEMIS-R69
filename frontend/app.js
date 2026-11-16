@@ -11,6 +11,64 @@ function u32(v,o){return new DataView(v.buffer,v.byteOffset,v.byteLength).getUin
 function hex(n){return '0x'+Number(n).toString(16).padStart(8,'0');}
 function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000);}
 
+// One-tap smart discovery. This is deliberately read-only: it never sends FEL_WRITE/FEL_EXEC.
+const SMART_PROFILE = { expectedVid: 0x1f3a, expectedPid: 0xefe8, soc: 'Allwinner H3 (reported)', board: 'R69-EMCP V2.0 (reported)', memory: 'SanDisk SD9DS28K-8G / LPDDR3 (reported)' };
+const smartStep = (name, text, cls='ok') => { const el = document.querySelector(`[data-smart-step="${name}"]`); if(el){ el.textContent = text; el.className = cls; } };
+const smartJson = value => JSON.stringify(value, null, 2);
+function smartEndpoints(device) {
+  const endpoints = [];
+  const interfaces = [];
+  const config = device.configuration;
+  if (!config) return { interfaces, endpoints };
+  for (const iface of config.interfaces) for (const alt of iface.alternates) {
+    const row = { interfaceNumber: iface.interfaceNumber, alternateSetting: alt.alternateSetting, interfaceClass: alt.interfaceClass, interfaceSubclass: alt.interfaceSubclass, interfaceProtocol: alt.interfaceProtocol, endpoints: [] };
+    for (const ep of alt.endpoints) { const item = { number: ep.endpointNumber, direction: ep.direction, type: ep.type, packetSize: ep.packetSize }; row.endpoints.push(item); endpoints.push({ ...item, interfaceNumber: iface.interfaceNumber }); }
+    interfaces.push(row);
+  }
+  return { interfaces, endpoints };
+}
+function smartFindings(device, topology) {
+  const vid = device.vendorId === SMART_PROFILE.expectedVid;
+  const pid = device.productId === SMART_PROFILE.expectedPid;
+  const bulkIn = topology.endpoints.filter(e => e.direction === 'in' && e.type === 'bulk');
+  const bulkOut = topology.endpoints.filter(e => e.direction === 'out' && e.type === 'bulk');
+  const findings = [];
+  findings.push({ level: vid && pid ? 'pass' : 'warn', code: 'USB_IDENTITY', message: vid && pid ? 'VID/PID يطابقان واجهة Allwinner FEL المتوقعة.' : 'المعرف لا يطابق 1F3A:EFE8؛ لا تتابع إلى أي كتابة.' });
+  findings.push({ level: bulkIn.length && bulkOut.length ? 'pass' : 'fail', code: 'BULK_ENDPOINTS', message: bulkIn.length && bulkOut.length ? `تم العثور على Bulk IN=${bulkIn.map(x=>x.number).join(',')} وBulk OUT=${bulkOut.map(x=>x.number).join(',')}.` : 'لم يتم العثور على Bulk IN وBulk OUT معاً.' });
+  findings.push({ level: 'info', code: 'FEL_PROTOCOL', message: 'تم فحص الواصفات فقط. لم يتم إثبات FEL_VERSION ولم يتم إرسال أمر FEL.' });
+  findings.push({ level: 'info', code: 'BOARD_MATCH', message: 'H3/R69 وذاكرة eMCP معلومات مرجعية وليست قراءة مباشرة من الشريحة.' });
+  findings.push({ level: 'blocked', code: 'PERSISTENT_WRITE', message: 'كتابة eMCP وFEL_EXEC محجوزان حتى تتوفر نسخة احتياطية وتوافق مثبت.' });
+  return { findings, bulkIn, bulkOut, vid, pid };
+}
+async function runSmartScan() {
+  const summary = $('smartSummary'), findingsBox = $('smartFindings'), badge = $('smartBadge');
+  if (!summary || !findingsBox) return;
+  smartStep('browser', navigator.usb ? '✓ WebUSB متاح' : '■ غير متاح', navigator.usb ? 'ok' : 'danger');
+  if (!navigator.usb) { badge.textContent = 'توقف: WebUSB'; summary.textContent = 'استخدم Chrome/Chromium على Android عبر HTTPS أو localhost.'; findingsBox.textContent = 'الإصلاح: فعّل USB OTG، استخدم متصفحاً يدعم WebUSB، وتأكد من صلاحية USB Host.'; return; }
+  badge.textContent = 'جاري الفحص'; smartStep('usb', '◌ طلب الإذن…', 'warn');
+  try {
+    const device = await navigator.usb.requestDevice({ filters: [{ vendorId: SMART_PROFILE.expectedVid, productId: SMART_PROFILE.expectedPid }] });
+    state.usb = device;
+    const topology = smartEndpoints(device);
+    const result = smartFindings(device, topology);
+    smartStep('usb', result.vid && result.pid ? '✓ FEL VID/PID' : '⚠ معرف غير متوقع', result.vid && result.pid ? 'ok' : 'warn');
+    smartStep('endpoints', `${result.bulkIn.length}/${result.bulkOut.length} Bulk`, result.bulkIn.length && result.bulkOut.length ? 'ok' : 'danger');
+    smartStep('profile', result.vid && result.pid ? '⚠ مرشح H3/R69' : '■ غير مطابق', result.vid && result.pid ? 'warn' : 'danger');
+    smartStep('write', '■ محجوز', 'danger');
+    badge.textContent = result.vid && result.pid ? 'تم التعرف' : 'تحذير'; badge.className = result.vid && result.pid ? 'tag blue' : 'tag';
+    const identity = { vendorId: hex(device.vendorId), productId: hex(device.productId), manufacturerName: device.manufacturerName || null, productName: device.productName || null, serialNumber: device.serialNumber || null, usbVersionMajor: device.usbVersionMajor, configuration: device.configuration?.configurationValue ?? null, profile: SMART_PROFILE, interfaces: topology.interfaces, felVersionRead: false, felWriteEnabled: false, felExecEnabled: false };
+    summary.textContent = smartJson(identity);
+    findingsBox.textContent = smartJson({ findings: result.findings, nextAction: result.vid && result.bulkIn.length && result.bulkOut.length ? 'اقرأ تقرير الجهاز واطلب مراجعة توافق قبل أي استعادة.' : 'صحح الاتصال والواجهة أولاً.', safety: 'تشخيص فقط؛ لم يتم إرسال بيانات إلى SRAM/DRAM/eMCP.' });
+    log('smart-scan', `Smart scan completed for ${hex(device.vendorId)}:${hex(device.productId)}; no write/exec.`);
+  } catch (e) {
+    badge.textContent = 'فشل أو إلغاء'; smartStep('usb', '■ لم يتم الاتصال', 'danger'); smartStep('endpoints', '◌ لم يُفحص', 'warn'); smartStep('profile', '◌ لم يُفحص', 'warn');
+    summary.textContent = `لم تكتمل الجلسة: ${e.message}`;
+    findingsBox.textContent = 'الإصلاحات المقترحة:\n1) أدخل الجهاز في FEL قبل فتح الطلب.\n2) افصل الطاقة ثم أعد توصيل OTG.\n3) اختر 1F3A:EFE8 فقط.\n4) لا تستخدم كتابة eMCP من المتصفح.';
+    log('smart-scan-error', e.message);
+  }
+}
+$('smartScan')?.addEventListener('click', runSmartScan);
+
 // USB: descriptor enumeration only. This code intentionally sends no FEL transfer.
 $('usbConnect').addEventListener('click',async()=>{
   if(!navigator.usb){$('usbResult').textContent='WebUSB غير متاح في هذا المتصفح. جرّب Chrome على Android مع HTTPS أو localhost.';return;}
