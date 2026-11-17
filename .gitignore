@@ -9,4 +9,5 @@ bridge/fel_version
 bridge/fel_read
 bridge/fel_write
 bridge/fel_exec
+bridge/fel_spl_uboot
 bridge/fel_common.o

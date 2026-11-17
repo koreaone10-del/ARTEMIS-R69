@@ -294,6 +294,114 @@ $('splExec')?.addEventListener('click', async () => {
     log('bridge-spl-exec', `SPL exec at ${address}.`);
   } catch (e) { out.textContent = `فشل تنفيذ SPL: ${e.message}\n\nإذا كانت الرسالة عن مهلة (timeout)، فقد يكون SPL يعمل فعلاً — أعد فحص FEL_VERSION قبل افتراض الفشل.`; log('bridge-spl-exec-error', e.message); }
 });
+// Termux bridge v3: SPL + U-Boot (fel_spl_uboot) — upstream sunxi-fel
+// swap/thunk flow. Single Write+Exec call; the server validates the
+// full file and the C tool re-validates it, runs the thunk, requires
+// eGON.FEL, then stages U-Boot proper in DRAM and executes it.
+// The v2 raw SPL write above is DEPRECATED (it killed FEL on
+// 2026-11-17) — do not use it for SPL upload any more.
+const UB_MAX_FILE = 600 * 1024;
+const UB_EXPECTED = { size: 559480, sha256: '8c70a1809803b0bc22ba74217bb95312701c55ce1fb18342d08b5cf655ece071' };
+let ubFileBytes = null, ubFileSha256 = null;
+function ubValidateHeaders(buf) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const egon = new TextDecoder().decode(buf.subarray(4, 12));
+  if (egon !== 'eGON.BT0') return { ok: false, error: 'لا توجد ترويسة eGON.BT0 في الإزاحة 4' };
+  const splLen = view.getUint32(16, true);
+  if (splLen > 32768 || splLen % 4 !== 0) return { ok: false, error: 'طول SPL غير صالح (يجب أن يكون ≤ 32768 ومضاعفاً لـ 4)' };
+  let c = ((2 * view.getUint32(12, true)) - 0x5F0A6C39) >>> 0;
+  for (let i = 0; i < splLen / 4; i++) c = (c - view.getUint32(i * 4, true)) >>> 0;
+  if (c !== 0) return { ok: false, error: 'فشل checksum لـ eGON' };
+  if (buf.length <= 32768 + 64) return { ok: false, error: 'لا يوجد U-Boot proper في الملف — هذا ملف SPL وحده، مرفوض هنا' };
+  if (view.getUint32(32768, false) !== 0x27051956) return { ok: false, error: 'ترويسة mkimage غير صالحة عند الإزاحة 32768' };
+  if (buf[32768 + 29] !== 2) return { ok: false, error: 'معمارية U-Boot ليست ARM' };
+  if (buf[32768 + 30] !== 5) return { ok: false, error: 'نوع U-Boot ليس IH_TYPE_FIRMWARE' };
+  const load = view.getUint32(32768 + 16, false);
+  const entry = view.getUint32(32768 + 20, false);
+  const size = view.getUint32(32768 + 12, false);
+  if (size !== buf.length - 32768 - 64) return { ok: false, error: 'حجم بيانات U-Boot لا يطابق طول الملف' };
+  return { ok: true, splLen, load, entry, size };
+}
+function updateUbWriteExecButton() {
+  const btn = $('ubWriteExec');
+  if (!btn) return;
+  btn.disabled = !(ubFileBytes && $('ubAcknowledge')?.checked);
+}
+$('ubFile')?.addEventListener('change', async e => {
+  const f = e.target.files?.[0] || null;
+  const meta = $('ubFileMeta');
+  ubFileBytes = null; ubFileSha256 = null;
+  updateUbWriteExecButton();
+  if (!f) { if (meta) meta.textContent = 'لم يتم اختيار الملف الكامل.'; return; }
+  try {
+    const buf = new Uint8Array(await f.arrayBuffer());
+    if (buf.length > UB_MAX_FILE) { if (meta) meta.textContent = `الملف كبير جداً: ${buf.length} بايت (الحد 600KB). اختر الملف الكامل u-boot-sunxi-with-spl.bin (559,480 بايت).`; return; }
+    ubFileSha256 = await sha256Hex(buf);
+    const v = ubValidateHeaders(buf);
+    if (!v.ok) { if (meta) meta.textContent = `File: ${f.name}\nSize: ${buf.length} bytes\nSHA-256: ${ubFileSha256}\n\n✗ الملف مرفوض: ${v.error}\nتأكد أن هذا هو الملف الكامل u-boot-sunxi-with-spl.bin وليس SPL وحده.`; return; }
+    ubFileBytes = buf;
+    const shaMatch = ubFileSha256 === UB_EXPECTED.sha256;
+    if (meta) meta.textContent = `File: ${f.name}\nSize: ${buf.length} bytes\nSHA-256: ${ubFileSha256}\nSPL length: ${v.splLen} bytes\nU-Boot load/entry: 0x${v.load.toString(16)} / 0x${v.entry.toString(16)}, payload ${v.size} bytes\n\n${buf.length === UB_EXPECTED.size && shaMatch ? '✓ يطابق البناء المتوقع (LPDDR3 336 MHz, ZQ 3750393).' : '⚠ لا يطابق SHA-256 المتوقع للبناء الحالي (8c70a180…ece071). إذا كان هذا بناءً جديداً (مثلاً CLK 300)، فهذا متوقع — تأكد من مصدر الملف قبل المتابعة.'}`;
+    updateUbWriteExecButton();
+    log('bridge-spl-uboot-file', `Full U-Boot file selected: ${f.name} (${buf.length} bytes, sha ${ubFileSha256.slice(0, 12)}…).`);
+  } catch (err) { if (meta) meta.textContent = `تعذّرت قراءة الملف: ${err.message}`; }
+});
+$('ubAcknowledge')?.addEventListener('change', updateUbWriteExecButton);
+$('ubWriteExec')?.addEventListener('click', async () => {
+  const out = $('ubResult');
+  if (!out) return;
+  if (!ubFileBytes) { out.textContent = 'اختر الملف الكامل أولاً.'; return; }
+  out.textContent = 'جارٍ كتابة SPL + تنفيذ U-Boot… قد يستغرق حتى 60 ثانية. لا تفصل الجهاز ولا تغلق الصفحة.';
+  try {
+    const device = bridgeDeviceOrThrow();
+    if (!confirm(`تشغيل SPL + U-Boot (v3)؟\nيكتب SPL إلى SRAM 0x00000000 (مع تبديل المناطق المحمية وthunk)، ويتحقق من eGON.FEL، ثم يضع U-Boot في DRAM 0x4a000000 وينفذه.\nلا يكتب إلى eMMC أو Flash. الجهاز يجب أن يبقى في وضع FEL.`)) throw Error('ألغى المستخدم التشغيل.');
+    const base64 = base64EncodeBytes(ubFileBytes);
+    // Direct fetch (not bridgeCall): on failure the server returns
+    // the C tool's step log in detail.steps, and that log is the
+    // diagnosis — it must reach the screen, not be discarded.
+    const r = await fetch(BRIDGE_BASE + '/api/bridge/fel-spl-uboot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, base64, sha256: ubFileSha256, confirm: true }) });
+    const j = await r.json().catch(() => ({ ok: false, error: 'bad_json' }));
+    if (!r.ok) {
+      const steps = j.detail?.steps || [];
+      const stepText = steps.map(s => `${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`).join('\n');
+      out.textContent = `فشل SPL + U-Boot (${j.error || `HTTP ${r.status}`}): ${j.message || ''}\n\nخطوات التنفيذ:\n${stepText || '(لا توجد خطوات)'}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ هذا التقرير كاملاً وأرسله إلى Muse.`;
+      log('bridge-spl-uboot-error', `fel-spl-uboot failed: ${j.error || r.status}`);
+      return;
+    }
+    bridgeSetReport(j);
+    const steps = Array.isArray(j.steps) ? j.steps.map(s => `${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`).join('\n') : '';
+    out.textContent = `اكتمل SPL + U-Boot.\nSHA-256: ${ubFileSha256}\nU-Boot load/entry: ${j.uboot_load} / ${j.uboot_entry}\neGON.FEL: ${j.egon_fel ? 'نعم' : 'لا'} — U-Boot exec sent: ${j.uboot_exec_sent ? 'نعم' : 'لا'}\n\nخطوات التنفيذ:\n${steps}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nالآن اتبع قائمة ما بعد التشغيل أدناه.`;
+    const checklist = $('ubChecklist');
+    if (checklist) checklist.style.display = '';
+    log('bridge-spl-uboot', 'SPL + U-Boot flow completed.');
+    await refreshSessionQuiet();
+  } catch (e) { out.textContent = `فشل SPL + U-Boot: ${e.message}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ رسالة الخطأ كاملة وأرسلها إلى Muse.`; log('bridge-spl-uboot-error', e.message); }
+});
+$('ubRecheckFel')?.addEventListener('click', async () => {
+  const out = $('ubCheckResult');
+  if (!out) return;
+  out.textContent = 'جارٍ إعادة فحص FEL_VERSION…';
+  try {
+    const device = bridgeDeviceOrThrow();
+    const j = await bridgeCall('/api/bridge/fel-version', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device }) });
+    bridgeSetReport(j);
+    out.textContent = `✓ ردّ FEL_VERSION — U-Boot لم يستلم الجهاز (أو عاد FEL).\n\n${JSON.stringify(j, null, 2)}`;
+    log('bridge-spl-uboot-recheck', 'FEL_VERSION answered after uboot exec.');
+  } catch (e) { out.textContent = `✗ لم يردّ FEL_VERSION: ${e.message}\nقد يكون U-Boot يعمل، أو توقف FEL. أعد إدخال الجهاز في FEL وحاول مجدداً، وأرسل النتيجة إلى Muse.`; log('bridge-spl-uboot-recheck-error', e.message); }
+});
+$('ubReadEgon')?.addEventListener('click', async () => {
+  const out = $('ubCheckResult');
+  if (!out) return;
+  out.textContent = 'جارٍ قراءة 0x4…';
+  try {
+    const device = bridgeDeviceOrThrow();
+    const j = await bridgeCall('/api/bridge/fel-read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, address: '0x4', length: 8 }) });
+    bridgeSetReport(j);
+    const isFel = (j.hex || '').toLowerCase() === '65474f4e2e46454c';
+    out.textContent = (isFel ? '✓ eGON.FEL موجود — نفّذ SPL بنجاح.\n' : '✗ ليست eGON.FEL — توقف ولا تتابع إلى U-Boot.\n') + JSON.stringify(j, null, 2);
+    log('bridge-spl-uboot-egon', isFel ? 'eGON.FEL present at 0x4.' : 'eGON.FEL NOT present at 0x4.');
+  } catch (e) { out.textContent = `فشلت قراءة 0x4: ${e.message}`; log('bridge-spl-uboot-egon-error', e.message); }
+});
 $('bridgeCopyReport2')?.addEventListener('click', async () => {
   const out = $('splResult');
   if (!bridgeReport) { if (out) out.textContent = 'لا يوجد تقرير بعد. شغّل فحصاً أو قراءة أو كتابة أولاً.'; return; }
@@ -367,5 +475,5 @@ $('reviewBootCode').addEventListener('click',()=>{const code=$('bootCode').value
 
 $('askAI').addEventListener('click',async()=>{const prompt=$('aiPrompt').value.trim();if(!prompt){$('aiResult').textContent='اكتب المشكلة أو الكود أولاً.';return;}const context={extra:$('aiContext').value,device:'R69-EMCP V2.0 / H3 reported',firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,boot:state.boot};$('aiResult').textContent='ARTEMIS is analyzing…';try{const r=await fetch('/api/assistant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,context})});const j=await r.json();if(!r.ok)throw Error(j.message||j.error||'AI request failed');$('aiMode').textContent=`${j.mode} ${j.model||''}`;$('aiResult').textContent=`MODE: ${j.mode}\n\n${j.answer}\n\n${j.safety||''}`;log('assistant',`Assistant response via ${j.mode}`);}catch(e){$('aiResult').textContent=`تعذر الاتصال بالمساعد: ${e.message}\nتحقق من تشغيل خادم ARTEMIS.`;log('assistant-error',e.message);}});
 document.querySelectorAll('[data-prompt]').forEach(b=>b.addEventListener('click',()=>{$('aiPrompt').value=b.dataset.prompt;$('aiPrompt').focus();}));
-$('exportReport').addEventListener('click',()=>{const report={schema:'artemis-r69-report/v1',generatedAt:new Date().toISOString(),product:'ARTEMIS R69 v6.1',target:'SHUNJUEY R69-EMCP V2.0',mode:'READ_ONLY',device:{socExpected:'Allwinner H3',socIdExpected:'0x1680',board:'dolphin-p1',emcpReported:'SanDisk SD9DS28K-8G'},usb:state.usb?{vendorId:state.usb.vendorId,productId:state.usb.productId,felVersionRead:false}:null,firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,bootArtifacts:state.boot,logs:state.logs,safety:{felWrite:'sram-only (bridge v2)',felExec:'sram-only, session-gated (bridge v2)',emmcWrite:false,ramPatternTest:false,recoveryImageBuilder:false,note:'No persistent writes or arbitrary execution are implemented. FEL_WRITE / FEL_EXEC are confined to H3 SRAM and require a prior write in the same bridge session.'}};downloadBlob(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'ARTEMIS_R69_diagnostic_report.json');$('reportPreview').textContent=JSON.stringify({generatedAt:report.generatedAt,mode:report.mode,firmwareEntries:report.firmware?.count||0,bootArtifacts:report.bootArtifacts.length,logEntries:report.logs.length,safety:report.safety},null,2);log('report','Exported diagnostic JSON report.');});
+$('exportReport').addEventListener('click',()=>{const report={schema:'artemis-r69-report/v1',generatedAt:new Date().toISOString(),product:'ARTEMIS R69 v6.1',target:'SHUNJUEY R69-EMCP V2.0',mode:'READ_ONLY',device:{socExpected:'Allwinner H3',socIdExpected:'0x1680',board:'dolphin-p1',emcpReported:'SanDisk SD9DS28K-8G'},usb:state.usb?{vendorId:state.usb.vendorId,productId:state.usb.productId,felVersionRead:false}:null,firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,bootArtifacts:state.boot,logs:state.logs,safety:{felWrite:'sram-only (bridge v3)',felExec:'sram-only, session-gated (bridge v3)',felSplUboot:'upstream sunxi-fel swap/thunk + eGON.FEL check, DRAM staging at mkimage load address (bridge v3)',emmcWrite:false,ramPatternTest:false,recoveryImageBuilder:false,note:'No persistent writes or arbitrary execution are implemented. FEL_WRITE / FEL_EXEC are confined to H3 SRAM and require a prior write in the same bridge session. The v2 raw SPL write is deprecated: it killed FEL on 2026-11-17; SPL upload uses the v3 fel-spl-uboot flow only.'}};downloadBlob(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'ARTEMIS_R69_diagnostic_report.json');$('reportPreview').textContent=JSON.stringify({generatedAt:report.generatedAt,mode:report.mode,firmwareEntries:report.firmware?.count||0,bootArtifacts:report.bootArtifacts.length,logEntries:report.logs.length,safety:report.safety},null,2);log('report','Exported diagnostic JSON report.');});
 fetch('/api/ai/status').then(r=>r.json()).then(j=>{document.getElementById('aiMode').textContent=j.endpointConfigured?`AI endpoint configured • ${j.model} • ${j.authentication}`:'Offline rules active — configure a no-key local model endpoint for generative AI';}).catch(()=>{document.getElementById('aiMode').textContent='AI status unavailable';});

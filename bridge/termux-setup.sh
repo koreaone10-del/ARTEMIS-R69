@@ -1,10 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# ARTEMIS Termux bridge -- setup (v2, SRAM-only FEL read/write/exec)
+# ARTEMIS Termux bridge -- setup (v3, SRAM-only FEL read/write/exec
+# + upstream-style SPL + U-Boot staging)
 #
 # Installs the Termux packages the bridge needs, builds the native
-# tools (usb_probe, fel_version, fel_read, fel_write, fel_exec)
-# from this repo, and creates bridge/run/ and bridge/reports/ for
-# probe reports and the bridge session file.
+# tools (usb_probe, fel_version, fel_read, fel_write, fel_exec,
+# fel_spl_uboot) from this repo, and creates bridge/run/ and
+# bridge/reports/ for probe reports and the bridge session file.
 #
 # Idempotent: safe to run again. It never writes to the TV Box.
 # It does NOT install sunxi-fel by default: stock sunxi-fel cannot
@@ -30,7 +31,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-echo "== ARTEMIS Termux bridge setup (v2, SRAM-only) =="
+echo "== ARTEMIS Termux bridge setup (v3, SRAM-only + SPL/U-Boot) =="
 echo "Repo: $ROOT"
 
 if [ -z "${PREFIX:-}" ]; then
@@ -78,6 +79,10 @@ echo "-- Building bridge/fel_exec (FEL_EXEC, SRAM only) --"
 "$CC" -O2 -Wall -Wextra -o bridge/fel_exec \
   bridge/fel_exec.c bridge/fel_common.c -lusb-1.0
 
+echo "-- Building bridge/fel_spl_uboot (v3: upstream SPL swap/thunk + U-Boot staging) --"
+"$CC" -O2 -Wall -Wextra -o bridge/fel_spl_uboot \
+  bridge/fel_spl_uboot.c bridge/fel_common.c -lusb-1.0
+
 mkdir -p bridge/run bridge/reports
 
 echo "-- Checking node --"
@@ -89,8 +94,10 @@ echo "-- Quick self-test (no device needed) --"
 ./bridge/fel_read || echo "(expected: usage error, exit 2)"
 TERMUX_USB_FD=99 ./bridge/fel_read 0x40000000 16 || echo "(expected: DRAM refused, exit 2)"
 ./bridge/fel_exec || echo "(expected: usage error, exit 2)"
+./bridge/fel_spl_uboot || echo "(expected: usage error, exit 2)"
+./bridge/fel_spl_uboot 99 /dev/null || echo "(expected: file validation error, exit 1)"
 
-echo "-- sunxi-fel (optional, NOT required for v2) --"
+echo "-- sunxi-fel (optional, NOT required for v3) --"
 if command -v sunxi-fel >/dev/null 2>&1; then
   echo "sunxi-fel: AVAILABLE at $(command -v sunxi-fel)"
   sunxi-fel version 2>&1 | head -2 || true
@@ -111,7 +118,7 @@ elif [ "${BRIDGE_BUILD_SUNXI:-0}" = "1" ]; then
   fi
   set -e
 else
-  echo "sunxi-fel: NOT AVAILABLE (and not required for v2)."
+  echo "sunxi-fel: NOT AVAILABLE (and not required for v3)."
   echo "Stock sunxi-fel cannot use a termux-usb file-descriptor handoff,"
   echo "so building it would not add a working FEL path on the phone."
   echo "To try anyway: BRIDGE_BUILD_SUNXI=1 bash bridge/termux-setup.sh"
@@ -126,4 +133,6 @@ echo "  4. In a second Termux session: npm start   # ARTEMIS on :3000"
 echo "  5. Open http://127.0.0.1:3000 and go to 'جسر Termux'."
 echo "  6. Test in order (see bridge/README.md): FEL_READ at 0x1000,"
 echo "     then the 16-byte pattern write + read-back, then -- only"
-echo "     with explicit approval -- the SPL upload + Exec."
+echo "     with explicit approval -- the SPL + U-Boot upload (v3 panel)."
+echo "     Do NOT use the old v2 raw SPL write: it killed FEL on"
+echo "     2026-11-17. Use the v3 SPL + U-Boot panel instead."

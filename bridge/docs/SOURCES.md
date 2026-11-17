@@ -1,10 +1,16 @@
 # Bridge sources — what was verified, and what was not
 
-Date: 2026-11-17 (v2 added the same day). No R69 device was available
-in the VM for this work, so nothing here is a claim about a live
-device test except the items explicitly marked **LIVE** below.
-Anything marked **UNVERIFIED** must be tested on the phone before
-it is presented as working.
+Date: 2026-11-17 (v2 added the same day; v3 the same day).
+No R69 device was available in the VM for this work, so nothing
+here is a claim about a live device test except the items
+explicitly marked **LIVE** below. Anything marked **UNVERIFIED**
+must be tested on the phone before it is presented as working.
+Line numbers for fel.c refer to the copy fetched 2026-11-17 from
+https://raw.githubusercontent.com/Icenowy/sunxi-tools/master/fel.c
+(1775 lines). The v2 draft cited line numbers from an older
+fel.c layout (e.g. H3 entry L1148-1162, SPL function
+L2045-2327); those were wrong for the current file and are
+corrected in v3 (§5, §6).
 
 ## Live results on the user's phone (2026-11-17)
 
@@ -33,6 +39,23 @@ it is presented as working.
   Everything in v2 about them is verified from source only, and
   is **UNVERIFIED** on hardware until the test plan in
   bridge/README.md is run on the phone.
+- **LIVE 2026-11-17, 15:29-15:30 UTC:** the pattern test passed
+  through the bridge page on `/dev/bus/usb/001/006`: FEL_WRITE of
+  28 bytes (`HELLO-FEL-PATTERN-0123456789`) to `0x1000`, then
+  FEL_READ read-back with identical SHA-256
+  `93a6594f99e0c9eeecce69137b536c238e90b46e7d99db725a99873085007fc8`.
+  The full FEL loop (probe, FEL_VERSION, FEL_READ, FEL_WRITE,
+  read-back) is proven live via the bridge page.
+- **LIVE 2026-11-17: the v2 raw SPL write KILLED FEL.** A v2
+  `fel_write` of 32768 bytes to `0x00000000` (spl-only.bin, SHA-256
+  `5979cc33…`) failed with "fel_write did not return JSON", and
+  afterwards FEL_VERSION direct produced NO output at all,
+  although `termux-usb -l` still listed the device at `001/006`.
+  The device was recovered by re-entering FEL: new path
+  `/dev/bus/usb/001/002`, permission granted, FEL_VERSION again
+  OK (`AWUSBFEX` / `0x1680` / H3). eMMC was never written. This is
+  the evidence for v3: the v2 raw SPL write must not be retried.
+  See §6.
 
 ## Verified from source
 
@@ -134,22 +157,22 @@ https://browse.dgit.debian.org/sunxi-tools.git/tree/fel.c).
 | `aw_fel_write` order | FEL_WRITE request, then AW_USB_WRITE of the data, then 8-byte FEL status | fel.c L525-535 |
 | `aw_fel_execute` order | FEL_EXEC request (address, length 0), then 8-byte FEL status only — no data transfer | fel.c L538-546 |
 
-### 5. H3 SRAM map (sunxi-fel `soc_sram_info`, fel.c) — verified for v2
+### 5. H3 SRAM map (sunxi-fel `soc_sram_info`, fel.c) — verified for v2, line numbers corrected for v3
 
-H3 entry in `soc_sram_info_table` (fel.c L1148-1162):
+H3 entry in `soc_sram_info_table` (fel.c L602-609):
 
 | Item | Value | Reference |
 |---|---|---|
-| soc_id | `0x1680` (H3) | fel.c L1150 |
-| scratch_addr — "a safe place to upload & run code" | `0x1000` | fel.c L1152, L870-892 |
-| mmu_tt_addr (16K-aligned MMU table) | `0x8000` | fel.c L1154 |
-| thunk_addr / thunk_size | `0xA200` / `0x200` | fel.c L1156 |
-| swap_buffers | `a10_a13_a20_sram_swap_buffers` | fel.c L1158, L913-929 |
-| sid_addr (SID_KEY[0-3] base) | `0x01C14200` | fel.c L1160 |
-| **spl_addr** | **not set in the H3 entry — the field defaults to `0`** | fel.c L1148-1162 (no `.spl_addr` line, unlike A64/A80 at L1120/L1168 which set `0x10000`) |
-| SPL load address for H3, effective | **`0x00000000`** (SRAM base; `cur_addr = sram_info->spl_addr` in `aw_fel_write_and_execute_spl`) | fel.c L2067 |
-| SPL_LEN_LIMIT (max SPL size; also the offset of the main U-Boot image inside `u-boot-sunxi-with-spl.bin`) | `0x8000` (32 KiB) | fel.c L2042 |
-| DRAM_BASE / DRAM_SIZE | `0x40000000` / `0x80000000` | fel.c L1276-1278 |
+| soc_id | `0x1680` (H3) | fel.c L603 |
+| scratch_addr — "a safe place to upload & run code" | `0x1000` | fel.c L604 |
+| mmu_tt_addr (16K-aligned MMU table) | `0x8000` | fel.c L605 |
+| thunk_addr / thunk_size | `0xA200` / `0x200` | fel.c L606 |
+| swap_buffers | `a10_a13_a20_sram_swap_buffers` | fel.c L607 |
+| sid_addr (SID_KEY[0-3] base) | `0x01C14200` | fel.c L608 (also L600 for the entry above it) |
+| **spl_addr** | **not set in the H3 entry — the field defaults to `0`** | fel.c L602-609 (no `.spl_addr` line, unlike A64/A80 which set `0x10000`) |
+| SPL load address for H3, effective | **`0x00000000`** (SRAM base; `cur_addr = sram_info->spl_addr` in `aw_fel_write_and_execute_spl`) | fel.c L1078-1190 |
+| SPL_LEN_LIMIT (max SPL size; also the offset of the main U-Boot image inside `u-boot-sunxi-with-spl.bin`) | `0x8000` (32 KiB) | fel.c L1076 |
+| DRAM_BASE / DRAM_SIZE | `0x40000000` / `0x80000000` | fel.c L670-671 |
 
 Distinguish two different "scratch" values — they are not the same:
 - The **FEL_VERSION reply** field `scratchpad` is `0x7e00`
@@ -158,85 +181,204 @@ Distinguish two different "scratch" values — they are not the same:
 - The **`soc_sram_info.scratch_addr`** used by upstream to upload
   and run small code is `0x1000` (fel.c L1152).
 
-Protected SRAM regions used by the v2 allowlist (fel.c
-L895-911 comment + `a10_a13_a20_sram_swap_buffers` L913-929):
+Protected SRAM regions used by the v2/v3 allowlist (the comment
+above `a10_a13_a20_sram_swap_buffers`, fel.c L482-490):
 - `0x1C00-0x1FFF` — BROM IRQ stack ("0x2000 (and growing down)
   for the IRQ handler").
 - `0x5C00-0x6FFF` — BROM stack ("0x7000 (and also growing
   down) for the regular code").
 - `0x7C00-0x7FFF` — "the addresses 0x7D00-0x7FFF contain
   something important too (overwriting them kills FEL)". The
-  v2 allowlist protects `0x7C00-0x8000` (the whole swap entry).
+  v2/v3 allowlist protects `0x7C00-0x8000` (the whole swap entry).
 - `0x8000-0xBFFF` — MMU translation table at `0x8000` and the
   thunk at `0xA200`; backup areas `0xA400`/`0xA800`/`0xBC00`
-  live here too. v2 protects `0x8000-0xC000`.
+  live here too. v2/v3 protect `0x8000-0xC000`.
 
-### 6. How upstream loads and executes an SPL — and what v2 does NOT do
+### 6. How upstream loads and executes an SPL — and what v3 implements
 
-`aw_fel_write_and_execute_spl` (fel.c L2045-2327) and
-`aw_fel_process_spl_and_uboot` (fel.c L2460-2484):
+`aw_fel_write_and_execute_spl` (fel.c L1078-1235),
+`aw_fel_write_uboot_image` (fel.c L1238-1296) and
+`aw_fel_process_spl_and_uboot` (fel.c L1300-1313), as called by
+sunxi-fel's `spl` / `uboot` commands (fel.c L1748-1763). v3
+(`bridge/fel_spl_uboot.c`, server endpoint
+`POST /api/bridge/fel-spl-uboot`) implements this flow
+faithfully, step by step, in the same order:
 
-1. The SPL file must start with the eGON header: bytes 4..11
-   are `"eGON.BT0"`, the length is LE32 word 4 (byte offset 16),
-   and the checksum is verified as
-   `spl_checksum = 2 * le32(buf32[3]) - 0x5F0A6C39` (word 3 is
-   byte offset 12), subtracting every LE32 word of the SPL; the
-   result must be 0 (fel.c L2081-2117). **v2 does not verify the eGON header or
-   checksum** — the UI/server only check size and SHA-256 of
-   the uploaded file. An SPL without a valid eGON header will
-   be refused by upstream's check; in v2 it would be written
-   and executed blindly. The user must verify the SPL with the
-   Bootloader Lab (eGON check) before upload.
-2. Upstream backs up the MMU state, disables the MMU, and (for
-   H3, which has `mmu_tt_addr`) generates a new translation
-   table at `0x8000` (fel.c L2129-2178).
-3. Upstream writes the SPL in pieces, **skipping the protected
-   regions**: the chunks at `0x1C00`, `0x5C00` and `0x7C00` are
-   written to the backup addresses `0xA400`, `0xA800` and
-   `0xBC00` instead (fel.c L2181-2227).
-4. Upstream writes a **thunk** (`fel-to-spl-thunk`, an ARM code
-   blob from `fel-to-spl-thunk.h`) at `0xA200`, and executes
-   the thunk — not the SPL directly. The thunk restores the
-   backed-up regions and then jumps to the SPL at `spl_addr`
-   (fel.c L2255-2293).
-5. After the thunk returns, upstream reads back
-   `spl_addr + 4` and requires the signature `"eGON.FEL"`
-   (fel.c L2306-2318). That is the only success proof for an
-   SPL run.
-6. If the file is larger than `SPL_LEN_LIMIT` (0x8000), the
-   remainder is treated as a main U-Boot image (mkimage header,
-   `IH_TYPE_FIRMWARE`) and written to the load address in its
-   own header (fel.c L2342-2451, L2476-2480). **v2 does not
-   implement this**: a `u-boot-sunxi-with-spl.bin` larger than
-   32 KiB is refused by the server (`spl_too_large`).
+1. **eGON header + checksum (fel.c L1097-1117).** The file must
+   start with the eGON header: bytes 4..11 are `"eGON.BT0"`,
+   the SPL length is LE32 word 4 (byte offset 16), and the
+   checksum is `spl_checksum = 2 * le32(buf32[3]) - 0x5F0A6C39`
+   (word 3 is byte offset 12), subtracting every LE32 word of
+   the SPL; the result must be 0. v3 checks this in the server
+   (`validateFullUbootImage` in `bridge/server.js`) **and** in
+   the C tool (`egon_checksum_ok` in `bridge/fel_spl_uboot.c`)
+   before touching the device. v2 did not check it at all.
+2. **Stack info, logging only (fel.c L1124, `aw_get_stackinfo`
+   L824-875).** Upstream reads `sp_irq` and `sp` by running
+   scratch code at `0x1000` that switches CPSR modes
+   (the "works everywhere" branch, L846-870) and logs them.
+   v3 does the same; a failure here is a warning step, not a
+   fatal error, because upstream uses the values only for
+   logging.
+3. **MMU backup (fel.c L1127, `aw_backup_and_disable_mmu`
+   L933-1016).** Upstream reads SCTLR via scratch code
+   (`aw_read_arm_cp_reg`, fel.c L673-692) and requires
+   `(sctlr & ~((0x7<<11)|(1<<6)|1)) == 0x00C50038`
+   (L975-980). If the MMU is not enabled — the H3 case
+   (fel.c L457-460) — it returns NULL ("MMU is not enabled by
+   BROM", L983-986). If it is enabled, upstream checks DACR
+   `== 0x55555555`, TTBCR `== 0`, TTBR0 16K-aligned, reads the
+   16 KiB table and validates every entry as a direct-mapped
+   section descriptor, then disables I-cache, MMU and branch
+   prediction with scratch code (L945-958). v3 implements all
+   of it, including the same SCTLR/DACR/TTBCR/TTBR0 checks.
+   The CP-register scratch code words in v3 are copied from
+   fel.c L673-716 (`mrc`/`mcr` + `dsb`/`isb` + `bx lr`).
+4. **MMU setup for H3 (fel.c L1129-1150).** When the backup
+   returned NULL and `mmu_tt_addr` is set (H3: `0x8000`),
+   upstream requires it 16K-aligned, sets DACR `0x55555555`,
+   TTBCR `0x00000000`, TTBR0 `0x8000`, and generates a new
+   translation table host-side (`aw_generate_mmu_translation_table`,
+   fel.c L914-931: `tt[i] = 0xDE2 | (i<<20)`, with `tt[0]` and
+   `tt[0xFFF]` OR-ed with `0x1000`). **Quirk, preserved
+   faithfully:** upstream sets the registers here but writes
+   the table back to the device only in the restore step
+   (step 8). v3 does the same and documents it; the table is
+   not written to `0x8000` at setup time.
+5. **SPL piece writes with the swap (fel.c L1151-1175).**
+   Upstream walks `swap_buffers` in order
+   (`a10_a13_a20_sram_swap_buffers`, fel.c L482-490):
+   - `{0x01C00 -> 0xA400, size 0x0400}` (IRQ stack)
+   - `{0x05C00 -> 0xA800, size 0x1400}` (stack)
+   - `{0x07C00 -> 0xBC00, size 0x0400}` ("something important")
+   - terminator `{0}`
+   For each entry it first shrinks `spl_len_limit` if the
+   backup buffer lies inside `[spl_addr, spl_addr+limit)`,
+   then writes the SPL bytes before the protected region to
+   their real address, and the bytes that fall on the
+   protected region to the **backup** address instead.
+   After the loop, if `thunk_addr < spl_len_limit` the limit
+   shrinks to `thunk_addr` (L1177-1178), SPL longer than the
+   limit is refused (L1181-1187), and any remaining bytes are
+   written at the current address (L1189). Only the first
+   `spl_len` bytes are written — never the `0xFF` padding
+   after them. v3 implements the loop identically, with the
+   same backup addresses (verified, not guessed).
+6. **Thunk (fel.c L1190-1213).** Upstream builds a buffer of
+   `sizeof(fel_to_spl_thunk) + sizeof(spl_addr) + (nswap+1) *
+   sizeof(swap entry)` bytes — for H3: 264 + 4 + 4*12 = **316
+   bytes**, which must fit `thunk_size` 0x200 (512) — copies
+   the thunk words, then `spl_addr`, then the swap table
+   including its terminator, converts every word to LE32,
+   writes the buffer to `thunk_addr` (`0xA200`) and executes
+   it there. The thunk itself (`fel_to_spl_thunk`, fel.c
+   L666, from `fel-to-spl-thunk.h`, generated by
+   `ruby -x fel-to-spl-thunk.S`): swaps every swap buffer
+   (buf1 <-> buf2, word by word), sets up its own stack,
+   disables IRQ/FIQ, re-verifies the SPL eGON checksum,
+   writes `"eGON.FEL"` at `spl_addr+4` on success (or
+   `"eGON.CRC"` / `"eGON.CAC"` on failure), jumps to the SPL
+   (`blx r8`), and on return swaps the buffers back and
+   returns to FEL (`bx lr`). v3 embeds the **66 words verbatim**
+   from the fetched `fel-to-spl-thunk.h` (264 bytes, offsets
+   `0x0-0x104`, starting `0xea000015` / `b 5c <setup_stack>`,
+   ending `0xe59dd000` / `0xe12fff1e`); nothing about them was
+   invented. The v3 thunk buffer layout and LE32 conversion
+   follow fel.c L1190-1209 exactly.
+7. **Wait + eGON.FEL read-back (fel.c L1214-1225).** Upstream
+   sleeps 250 ms (`usleep(250000)`, L1217, with a TODO comment
+   about a bug needing the workaround), then FEL_READs 8 bytes
+   at `spl_addr + 4` and requires `"eGON.FEL"` — that is the
+   only success proof for an SPL run. If it is not there,
+   upstream exits with the failure code in the header. **v3
+   stops here and does not stage U-Boot** if the signature is
+   absent, and returns the step log so the failure can be
+   reported.
+8. **MMU restore (fel.c L1227-1228, `aw_restore_and_enable_mmu`
+   L1018-1076).** If a table exists, upstream writes it back
+   to the current TTBR0, after clearing the TEXCB bits and
+   setting TEXCB `00100` (normal uncached) for DRAM and
+   `00111` (normal write-back cached) for the BROM section
+   `0xFFF`, then enables I-cache, MMU and branch prediction
+   with scratch code (L1028-1042). v3 implements it identically.
+   **Deviation, documented:** upstream writes the table to
+   whatever TTBR0 reads as; v3 refuses a TTBR0 of 0 rather
+   than writing a 16 KiB table to address 0.
+9. **U-Boot proper (fel.c L1238-1296).** `aw_fel_write_uboot_image`
+   takes the bytes after `SPL_LEN_LIMIT` (32 KiB): it requires
+   `len > HEADER_SIZE` (64 = 32 name offset + 32 name length,
+   fel.c L145-146), checks the mkimage header with
+   `get_image_type` (fel.c L158-172: magic `0x27051956`
+   big-endian, arch byte 29 must be 2 = ARM, type byte 30 is
+   returned), requires `IH_TYPE_FIRMWARE` (5), reads
+   `data_size = be32(buf32[3])` (offset 12) and
+   `load_addr = be32(buf32[4])` (offset 16), requires
+   `data_size == len - HEADER_SIZE`, then writes the payload
+   (`buf + HEADER_SIZE`) to `load_addr` and records
+   `uboot_entry = load_addr` (L1290-1293). Upstream does **not**
+   verify the mkimage header/data CRCs (TODO, fel.c
+   L1273-1284) — v3 does not either. v3 validates the header
+   server-side and in the C tool before any write, and adds one
+   safety refusal upstream does not have: the load address must
+   lie inside DRAM (`0x40000000-0xC0000000`); any other address
+   is refused.
+10. **U-Boot exec (fel.c L1748-1763, the `uboot` command).**
+    Upstream executes `uboot_entry` (== load address) on exit.
+    The exec request itself must be accepted (AWUS reply); the
+    8-byte FEL status afterwards is **not** expected, because
+    U-Boot takes over the CPU and never returns to FEL. v3
+    reports that as `"uboot_exec_sent, no FEL reply expected"`
+    with the step log, not as a failure, and instructs
+    re-checking FEL_VERSION afterwards (a reply means U-Boot
+    did not take over; no reply may mean it is running).
+
+**Deviations of v3 from upstream (deliberate, all documented
+in `bridge/fel_spl_uboot.c`):**
+- U-Boot staging is written in **64 KiB FEL_WRITE chunks**
+  instead of one FEL_WRITE, because `fel_common.c` uses a
+  5000 ms per-transfer bulk timeout (upstream uses 60000 ms)
+  and a single 526 KiB transfer could time out on the phone.
+  The bytes landing in DRAM are identical. See §7.
+- The C tool refuses a TTBR0 of 0 in the MMU restore (step 8)
+  and refuses U-Boot load addresses outside DRAM (step 9);
+  upstream has neither refusal.
+- `aw_get_stackinfo` failure is a warning step in v3, not
+  fatal; upstream only logs the values (step 2).
 
 **Consequence for v2:** the v2 SPL form does a raw
 `FEL_WRITE` of the file to `0x00000000` followed by a raw
 `FEL_EXEC` at `0x00000000`, with **no stack swap, no MMU
 handling, no thunk, no eGON checksum check, and no
 `eGON.FEL` read-back**. That is a deliberate simplification,
-and it is **UNVERIFIED and risky**: writing the SPL over the
-live BROM stacks (`0x1C00`/`0x5C00`/`0x7C00`) can kill FEL
-mid-transfer, and executing at `0x0` without the thunk has
-never been tested. The `--spl` flag / `spl:true` body field
-exist so this path is explicit and auditable. The safe
-pattern test (16 bytes at `0x1000`, read back and compare)
-must pass first, and SPL exec needs explicit user approval
-for that single run. A correct upstream-style SPL loader
-(swap + thunk + eGON check) is v3 work, not v2.
+and on **2026-11-17 it was proven to kill FEL**: a 32768-byte
+SPL write to `0x0` failed with "fel_write did not return
+JSON", and FEL_VERSION afterwards produced no output at all
+until the device was re-entered into FEL (new path
+`/dev/bus/usb/001/002`). **Do not retry the v2 raw SPL
+write.** The v2 `spl:true` form and its UI panel are
+deprecated in v3; SPL upload must go through
+`POST /api/bridge/fel-spl-uboot` (v3), which implements the
+flow above. The pattern test (28 bytes at `0x1000`,
+read-back SHA-256 match, proven live 2026-11-17) still uses
+the v2 tools and must pass first.
 
-### 7. Timeout deviation — deliberate (v1, kept in v2)
+### 7. Timeout deviation — deliberate (v1, kept in v2 and v3)
 
 `fel_common.c` uses 5000 ms per bulk transfer, not upstream's
 60000 ms. A single small FEL exchange is 32 bytes in and 32
 bytes out; if it has not answered in 5 s on the phone, the
 bridge server (which enforces its own timeouts: 10 s read,
-30 s write, 10 s exec) should fail fast and report a timeout,
-not hang. If a real H3 answers slowly on some phones, this
-value may need raising — that is a test result, not a guess
-to make now. Note: an SPL that takes over the device never
-returns a FEL status, so `fel_exec` timing out after an SPL
-exec is an expected outcome, not proof of failure.
+30 s write, 10 s exec, **60 s for fel-spl-uboot**) should fail
+fast and report a timeout, not hang. If a real H3 answers
+slowly on some phones, this value may need raising — that is a
+test result, not a guess to make now. Note: an SPL that takes
+over the device never returns a FEL status, so `fel_exec`
+timing out after an SPL exec is an expected outcome, not proof
+of failure. **v3 consequence:** the U-Boot proper staging
+(~527 KiB) is written in 64 KiB FEL_WRITE chunks instead of
+upstream's single `aw_write_buffer` call, so no single transfer
+is large enough to hit the 5 s bulk timeout; the bytes landing
+in DRAM are identical.
 
 ### 8. sunxi-fel on Termux — NOT a working path in v2
 
@@ -269,9 +411,16 @@ exec is an expected outcome, not proof of failure.
   for fel_version on 2026-11-17, which is encouraging but not
   proof for a second open of the device).
 - Whether the 5 s FEL timeout is enough for a 128 KiB write on
-  that phone (the server allows 30 s for the whole write call).
+  that phone (the server allows 30 s for the whole write call;
+  v3 stages U-Boot in 64 KiB chunks for the same reason).
+- Whether the v3 SPL + U-Boot flow works on the real R69:
+  the swap/thunk/eGON.FEL sequence and the DRAM staging are
+  implemented from fel.c source only (§6) and have never run
+  against a live H3. A live run is the only proof.
 - Whether the raw SPL write+exec at `0x00000000` works without
-  upstream's swap/thunk (see §6 — expected to be fragile).
+  upstream's swap/thunk — **answered 2026-11-17: it does NOT;
+  it killed FEL** (see the live results at the top of this file
+  and §6). Do not retry it.
 - The exact `/dev/bus/usb/001/002` path on the user's phone; it
   changes with the USB port / hub, so always re-run
   `termux-usb -l` first.

@@ -11,6 +11,13 @@
  * reaches the device: the tests assert the refusal, not a device
  * result. FEL_READ / FEL_WRITE / FEL_EXEC on real hardware are
  * UNVERIFIED.
+ *
+ * v3: validateFullUbootImage and the fel-spl-uboot endpoint are
+ * tested the same way — a valid full u-boot-sunxi-with-spl.bin
+ * is built in-memory (eGON header + checksum + mkimage header)
+ * and must pass validation; every bad variant must be refused
+ * before any device access. The SPL swap/thunk/eGON.FEL flow
+ * itself runs only on a live H3 and is UNVERIFIED.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,7 +25,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
-const { createServer, buildTermuxUsbCmd } = require('../server');
+const { createServer, buildTermuxUsbCmd, validateFullUbootImage } = require('../server');
 
 function startTestServer() {
   return new Promise((resolve, reject) => {
@@ -46,17 +53,18 @@ async function post(base, p, body) {
 
 const DEV = '/dev/bus/usb/001/004';
 
-test('status is sram-only v2, localhost, and reports no emmc capability', async () => {
+test('status is sram-only+spl-uboot v3, localhost, and reports no emmc capability', async () => {
   const { server, base } = await startTestServer();
   try {
     const res = await fetch(`${base}/api/bridge/status`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.ok, true);
-    assert.equal(body.mode, 'read-write-sram-only');
-    assert.equal(body.bridge, 'artemis-termux-bridge/v2');
+    assert.equal(body.mode, 'read-write-sram-only+spl-uboot');
+    assert.equal(body.bridge, 'artemis-termux-bridge/v3');
     assert.equal(body.host, '127.0.0.1');
     assert.equal(body.emmcWriteEnabled, false);
+    assert.equal(typeof body.felSplUbootAvailable, 'boolean');
     assert.equal(typeof body.felReadAvailable, 'boolean');
     assert.equal(typeof body.felWriteAvailable, 'boolean');
     assert.equal(typeof body.felExecAvailable, 'boolean');
@@ -285,4 +293,208 @@ test('fel-exec rejects a missing confirm with 400', async () => {
     assert.equal(dram.status, 403);
     assert.equal(dram.body.error, 'address_not_allowed');
   } finally { await stop(server); }
+});
+
+/* --- v3: fel-spl-uboot validation --- */
+
+/* Build an in-memory full u-boot-sunxi-with-spl.bin with a valid
+ * eGON header + checksum and a valid mkimage header, matching the
+ * real build (SPL 24,576 bytes, U-Boot load/entry 0x4a000000).
+ * The eGON checksum is solved from fel.c L1102-1117:
+ *   2*w3 - 0x5F0A6C39 - sum(all words) == 0
+ * with w3 the checksum field itself, so w3 = 0x5F0A6C39 +
+ * sum(all other words) (mod 2^32). */
+function makeValidUbootImage({ splLen = 24576, load = 0x4a000000, payloadSize = 526648 } = {}) {
+  const total = 32768 + 64 + payloadSize;
+  const buf = Buffer.alloc(total, 0xab);
+  // SPL header.
+  buf.write('eGON.BT0', 4, 'latin1');
+  buf.writeUInt32LE(splLen, 16);
+  // Deterministic SPL payload words (avoid the checksum field).
+  for (let off = 32; off < splLen; off += 4) buf.writeUInt32LE(0x12345678 + off, off);
+  let sumOthers = 0;
+  for (let off = 0; off < splLen; off += 4) {
+    if (off === 12) continue;
+    sumOthers = (sumOthers + buf.readUInt32LE(off)) >>> 0;
+  }
+  buf.writeUInt32LE((0x5F0A6C39 + sumOthers) >>> 0, 12);
+  // U-Boot proper mkimage header at offset 32768 (big-endian).
+  const h = 32768;
+  buf.writeUInt32BE(0x27051956, h + 0);
+  buf[h + 29] = 2; // IH_ARCH_ARM
+  buf[h + 30] = 5; // IH_TYPE_FIRMWARE
+  buf.writeUInt32BE(payloadSize, h + 12); // data_size
+  buf.writeUInt32BE(load, h + 16); // load address
+  buf.writeUInt32BE(load, h + 20); // entry address
+  buf.write('ARTEMIS-R69-test', h + 32, 'latin1');
+  return buf;
+}
+
+function splUbootBody(overrides) {
+  const data = makeValidUbootImage();
+  return {
+    device: DEV,
+    base64: data.toString('base64'),
+    sha256: crypto.createHash('sha256').update(data).digest('hex'),
+    confirm: true,
+    ...overrides,
+  };
+}
+
+test('validateFullUbootImage accepts the real-shaped full image', () => {
+  const data = makeValidUbootImage();
+  assert.equal(data.length, 559480);
+  const v = validateFullUbootImage(data);
+  assert.equal(v.ok, true);
+  assert.equal(v.spl_len, 24576);
+  assert.equal(v.uboot_load, 0x4a000000);
+  assert.equal(v.uboot_entry, 0x4a000000);
+  assert.equal(v.uboot_size, 526648);
+  // The same bytes must also pass the C tool's validation: run the
+  // compiled binary (if present) with a bad fd and check that all
+  // four validation steps pass before fel_open fails.
+  const fs = require('node:fs');
+  const bin = path.join(__dirname, '..', 'fel_spl_uboot');
+  if (fs.existsSync(bin)) {
+    const { spawnSync } = require('node:child_process');
+    const tmp = path.join(__dirname, 'tmp-valid-uboot.bin');
+    fs.writeFileSync(tmp, data);
+    try {
+      const r = spawnSync(bin, ['3', tmp], { encoding: 'utf8', timeout: 10000 });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false); // no USB device on fd 3
+      assert.deepEqual(out.steps.map((s) => s.name), [
+        'validate_file_size', 'validate_egon_header',
+        'validate_egon_checksum', 'validate_uboot_header',
+      ]);
+      assert.ok(out.steps.every((s) => s.ok));
+      assert.equal(out.file_sha256, crypto.createHash('sha256').update(data).digest('hex'));
+    } finally { fs.unlinkSync(tmp); }
+  }
+});
+
+test('validateFullUbootImage refuses bad eGON, bad checksum, oversize SPL, and a bad U-Boot header', () => {
+  const good = makeValidUbootImage();
+  const badEgon = Buffer.from(good);
+  badEgon.write('XXXX.BT0', 4, 'latin1');
+  assert.equal(validateFullUbootImage(badEgon).error, 'bad_egon');
+  const badChecksum = Buffer.from(good);
+  badChecksum[1000] ^= 0xff;
+  assert.equal(validateFullUbootImage(badChecksum).error, 'bad_checksum');
+  const bigSpl = Buffer.from(good);
+  bigSpl.writeUInt32LE(32772, 16); // > SPL_LEN_LIMIT, multiple of 4
+  assert.equal(validateFullUbootImage(bigSpl).error, 'spl_too_large');
+  const badMagic = Buffer.from(good);
+  badMagic.writeUInt32BE(0xdeadbeef, 32768);
+  assert.equal(validateFullUbootImage(badMagic).error, 'bad_uboot_header');
+  const badArch = Buffer.from(good);
+  badArch[32768 + 29] = 0x15; // not ARM
+  assert.equal(validateFullUbootImage(badArch).error, 'bad_uboot_header');
+  const badType = Buffer.from(good);
+  badType[32768 + 30] = 2; // not IH_TYPE_FIRMWARE
+  assert.equal(validateFullUbootImage(badType).error, 'bad_uboot_header');
+  const badSize = Buffer.from(good);
+  badSize.writeUInt32BE(123, 32768 + 12); // data_size mismatch
+  assert.equal(validateFullUbootImage(badSize).error, 'bad_uboot_header');
+  const splOnly = Buffer.from(good.subarray(0, 32768));
+  assert.equal(validateFullUbootImage(splOnly).error, 'no_uboot_proper');
+});
+
+test('validateFullUbootImage refuses U-Boot load addresses outside DRAM (eMMC/flash-style targets)', () => {
+  for (const load of [0x00000000, 0x01000000, 0x00020000, 0x3fffffff, 0xc0000000]) {
+    const img = makeValidUbootImage({ load });
+    const v = validateFullUbootImage(img);
+    assert.equal(v.ok, false, `load 0x${load.toString(16)}`);
+    assert.equal(v.error, 'uboot_address_not_allowed');
+  }
+  // A load at the very end of DRAM with a payload that overflows it.
+  const img = makeValidUbootImage({ load: 0xc0000000 - 100 });
+  assert.equal(validateFullUbootImage(img).error, 'uboot_address_not_allowed');
+});
+
+test('fel-spl-uboot rejects a missing confirm, a sha256 mismatch, and an oversize file, before any device access', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const noConfirm = await post(base, '/api/bridge/fel-spl-uboot', splUbootBody({ confirm: undefined }));
+    assert.equal(noConfirm.status, 400);
+    assert.equal(noConfirm.body.error, 'confirm_required');
+    const wrongConfirm = await post(base, '/api/bridge/fel-spl-uboot', splUbootBody({ confirm: 'yes' }));
+    assert.equal(wrongConfirm.status, 400);
+    assert.equal(wrongConfirm.body.error, 'confirm_required');
+    const badSha = await post(base, '/api/bridge/fel-spl-uboot', splUbootBody({ sha256: '00'.repeat(32) }));
+    assert.equal(badSha.status, 400);
+    assert.equal(badSha.body.error, 'sha256_mismatch');
+    const big = Buffer.alloc(600 * 1024 + 1, 0x41);
+    const over = await post(base, '/api/bridge/fel-spl-uboot', {
+      device: DEV,
+      base64: big.toString('base64'),
+      sha256: crypto.createHash('sha256').update(big).digest('hex'),
+      confirm: true,
+    });
+    assert.equal(over.status, 400);
+    assert.equal(over.body.error, 'invalid_size');
+  } finally { await stop(server); }
+});
+
+test('fel-spl-uboot rejects bad eGON, bad checksum, oversize SPL, and a bad U-Boot header with 400', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const cases = [
+      ['bad_egon', (() => { const b = makeValidUbootImage(); b.write('XXXX.BT0', 4, 'latin1'); return b; })()],
+      ['bad_checksum', (() => { const b = makeValidUbootImage(); b[1000] ^= 0xff; return b; })()],
+      ['spl_too_large', (() => { const b = makeValidUbootImage(); b.writeUInt32LE(32772, 16); return b; })()],
+      ['bad_uboot_header', (() => { const b = makeValidUbootImage(); b.writeUInt32BE(0xdeadbeef, 32768); return b; })()],
+      ['no_uboot_proper', (() => makeValidUbootImage().subarray(0, 32768))()],
+      ['uboot_address_not_allowed', (() => makeValidUbootImage({ load: 0x01000000 }))()],
+    ];
+    for (const [expected, data] of cases) {
+      const buf = Buffer.from(data);
+      const { status, body } = await post(base, '/api/bridge/fel-spl-uboot', {
+        device: DEV,
+        base64: buf.toString('base64'),
+        sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+        confirm: true,
+      });
+      assert.equal(status, 400, expected);
+      assert.equal(body.error, expected);
+    }
+  } finally { await stop(server); }
+});
+
+test('fel-spl-uboot with a valid file passes validation (fails at the device, never at validation)', async () => {
+  // In this VM the fel_spl_uboot binary is not built into
+  // bridge/, so the endpoint must stop at "binary not built"
+  // AFTER validation passed. On the phone, termux-setup.sh
+  // builds it and the flow continues to the device.
+  const { server, base } = await startTestServer();
+  try {
+    const fs = require('node:fs');
+    const bin = path.join(__dirname, '..', 'fel_spl_uboot');
+    const { status, body } = await post(base, '/api/bridge/fel-spl-uboot', splUbootBody());
+    if (fs.existsSync(bin)) {
+      // Binary present (a build was run): it must fail at the
+      // device, not at validation — termux-usb is absent in this
+      // VM (503), or the tool's step log is returned (502).
+      assert.ok(status === 502 || status === 503, `unexpected status ${status}`);
+      assert.notEqual(body.error, 'bad_egon');
+      assert.notEqual(body.error, 'bad_checksum');
+      assert.notEqual(body.error, 'bad_uboot_header');
+      assert.notEqual(body.error, 'spl_too_large');
+      assert.notEqual(body.error, 'no_uboot_proper');
+      assert.notEqual(body.error, 'uboot_address_not_allowed');
+      if (status === 502) assert.ok(Array.isArray(body.detail.steps));
+    } else {
+      assert.equal(status, 501);
+      assert.equal(body.error, 'fel_spl_uboot_not_built');
+    }
+  } finally { await stop(server); }
+});
+
+test('fel-spl-uboot command string is unquoted and rejects unsafe tokens', () => {
+  assert.equal(
+    buildTermuxUsbCmd('/x/bridge/fel_spl_uboot', ['/x/bridge/run/fel-spl-uboot-123-8c70a180.bin']),
+    '/x/bridge/fel_spl_uboot /x/bridge/run/fel-spl-uboot-123-8c70a180.bin',
+  );
+  assert.ok(!buildTermuxUsbCmd('/x/bridge/fel_spl_uboot', ['/x/bridge/run/f.bin']).includes("'"));
+  assert.throws(() => buildTermuxUsbCmd('/x/bridge/fel_spl_uboot', ['/x/bridge/run/f b.bin']), /unsafe termux-usb command token/);
 });
