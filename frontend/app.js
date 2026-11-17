@@ -140,6 +140,167 @@ $('bridgeCopyReport')?.addEventListener('click', async () => {
   catch { if (out) out.textContent = 'تعذّر النسخ التلقائي. حدّد نص التقرير وانسخه يدوياً.\n\n' + JSON.stringify(bridgeReport, null, 2); }
 });
 
+// Termux bridge v2: FEL_READ (SRAM + SID), pattern write/read-back,
+// SPL upload (SRAM only) and session-gated FEL_EXEC.
+// All write/exec calls require an explicit confirm; exec is refused
+// by the server unless the address was written in this session.
+const FEL_PATTERN = new TextEncoder().encode('HELLO-FEL-PATTERN-0123456789');
+let felPatternSha256 = null; // computed at runtime with crypto.subtle, never hardcoded
+function base64EncodeBytes(bytes) {
+  // Chunked: String.fromCharCode(...bytes) would overflow the
+  // argument limit for a 128 KiB SPL upload.
+  let binary = '';
+  const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+async function sha256Hex(buf) {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function bridgeDeviceOrThrow() {
+  const device = $('bridgeDevice')?.value.trim();
+  if (!device) throw Error('أدخل مسار الجهاز من termux-usb -l أولاً، مثال: /dev/bus/usb/001/002');
+  return device;
+}
+function bridgeSetReport(j) { bridgeReport = j; }
+$('bridgeSession')?.addEventListener('click', async () => {
+  const out = $('bridgeSessionResult');
+  if (!out) return;
+  out.textContent = 'جارٍ عرض الجلسة…';
+  try {
+    const s = await bridgeCall('/api/bridge/session');
+    out.textContent = JSON.stringify(s, null, 2);
+    refreshSplExecState(s.written || []);
+    log('bridge-session', `Session has ${(s.written || []).length} written range(s).`);
+  } catch (e) { out.textContent = `تعذّر عرض الجلسة: ${e.message}`; }
+});
+$('felReadRun')?.addEventListener('click', async () => {
+  const out = $('felReadResult');
+  if (!out) return;
+  out.textContent = 'جارٍ FEL_READ… لا تغلق الصفحة.';
+  try {
+    const device = bridgeDeviceOrThrow();
+    const address = $('felReadAddr')?.value.trim();
+    const length = Number($('felReadLen')?.value);
+    const j = await bridgeCall('/api/bridge/fel-read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, address, length }) });
+    bridgeSetReport(j);
+    out.textContent = JSON.stringify(j, null, 2);
+    log('bridge-fel-read', `FEL_READ ${address} x${length} ok.`);
+  } catch (e) { out.textContent = `فشل FEL_READ: ${e.message}`; log('bridge-fel-read-error', e.message); }
+});
+async function felWriteBytes(address, bytes, spl) {
+  const device = bridgeDeviceOrThrow();
+  const base64 = base64EncodeBytes(bytes);
+  const sha256 = await sha256Hex(bytes);
+  if (!confirm(`كتابة ${bytes.length} بايت إلى SRAM على العنوان ${address}؟\nهذه كتابة إلى SRAM فقط (متقلّبة)، وليست إلى eMMC أو Flash. الجهاز يجب أن يبقى في وضع FEL.`)) throw Error('ألغى المستخدم الكتابة.');
+  const j = await bridgeCall('/api/bridge/fel-write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, address, base64, sha256, confirm: true, spl: Boolean(spl) }) });
+  bridgeSetReport(j);
+  return j;
+}
+$('felPatternWrite')?.addEventListener('click', async () => {
+  const out = $('felPatternResult');
+  if (!out) return;
+  out.textContent = 'جارٍ كتابة النمط إلى 0x1000…';
+  try {
+    if (!felPatternSha256) felPatternSha256 = await sha256Hex(FEL_PATTERN);
+    const j = await felWriteBytes('0x1000', FEL_PATTERN, false);
+    out.textContent = `تمت الكتابة. SHA-256 المتوقع للنمط: ${felPatternSha256}\n\n` + JSON.stringify(j, null, 2) + '\n\nالآن اضغط "قراءة 0x1000 ومقارنة SHA-256".';
+    log('bridge-pattern-write', 'Pattern written to 0x1000.');
+    await refreshSessionQuiet();
+  } catch (e) { out.textContent = `فشلت كتابة النمط: ${e.message}`; log('bridge-pattern-write-error', e.message); }
+});
+$('felPatternVerify')?.addEventListener('click', async () => {
+  const out = $('felPatternResult');
+  if (!out) return;
+  out.textContent = 'جارٍ قراءة 0x1000 ومقارنة SHA-256…';
+  try {
+    const device = bridgeDeviceOrThrow();
+    if (!felPatternSha256) felPatternSha256 = await sha256Hex(FEL_PATTERN);
+    const j = await bridgeCall('/api/bridge/fel-read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, address: '0x1000', length: FEL_PATTERN.length }) });
+    bridgeSetReport(j);
+    const match = j.sha256 === felPatternSha256;
+    out.textContent = (match ? '✓ تطابق SHA-256 — الكتابة والقراءة تعملان.\n' : '✗ عدم تطابق SHA-256 — لا تتابع إلى SPL.\n') + `المتوقع: ${felPatternSha256}\nالمقروء: ${j.sha256}\n\n` + JSON.stringify(j, null, 2);
+    log('bridge-pattern-verify', match ? 'Pattern read-back matches.' : 'Pattern read-back MISMATCH.');
+  } catch (e) { out.textContent = `فشلت قراءة التحقق: ${e.message}`; log('bridge-pattern-verify-error', e.message); }
+});
+async function refreshSessionQuiet() {
+  try {
+    const s = await bridgeCall('/api/bridge/session');
+    const out = $('bridgeSessionResult');
+    if (out) out.textContent = JSON.stringify(s, null, 2);
+    refreshSplExecState(s.written || []);
+  } catch { /* session display is best-effort */ }
+}
+function refreshSplExecState(written) {
+  const addr = ($('splAddress')?.value || '0x00000000').trim().toLowerCase();
+  const n = written.some(r => {
+    const start = Number(r.address);
+    const target = addr.startsWith('0x') ? parseInt(addr, 16) : Number(addr);
+    return target >= start && target < start + Number(r.length);
+  });
+  const execBtn = $('splExec');
+  if (execBtn) execBtn.disabled = !n;
+}
+let splFileBytes = null, splFileSha256 = null;
+$('splFile')?.addEventListener('change', async e => {
+  const f = e.target.files?.[0] || null;
+  const meta = $('splFileMeta'), writeBtn = $('splWrite');
+  splFileBytes = null; splFileSha256 = null;
+  if (writeBtn) writeBtn.disabled = true;
+  if (!f) { if (meta) meta.textContent = 'لم يتم اختيار ملف SPL.'; return; }
+  try {
+    const buf = new Uint8Array(await f.arrayBuffer());
+    if (buf.length > 32768) { if (meta) meta.textContent = `الملف كبير جداً: ${buf.length} بايت (الحد 32768). SPL أكبر من SPL_LEN_LIMIT مرفوض في v2.`; return; }
+    splFileSha256 = await sha256Hex(buf);
+    splFileBytes = buf;
+    if (meta) meta.textContent = `File: ${f.name}\nSize: ${buf.length} bytes\nSHA-256: ${splFileSha256}\n\nتحقق من الترويسة في "مختبر Bootloader" (eGON.BT0) قبل الكتابة.`;
+    updateSplWriteButton();
+    log('bridge-spl-file', `SPL file selected: ${f.name} (${buf.length} bytes).`);
+  } catch (err) { if (meta) meta.textContent = `تعذّرت قراءة الملف: ${err.message}`; }
+});
+function updateSplWriteButton() {
+  const writeBtn = $('splWrite');
+  if (!writeBtn) return;
+  writeBtn.disabled = !(splFileBytes && $('splAcknowledge')?.checked);
+}
+$('splAcknowledge')?.addEventListener('change', updateSplWriteButton);
+$('splWrite')?.addEventListener('click', async () => {
+  const out = $('splResult');
+  if (!out) return;
+  if (!splFileBytes) { out.textContent = 'اختر ملف SPL أولاً.'; return; }
+  out.textContent = 'جارٍ كتابة SPL إلى SRAM… لا تفصل الجهاز.';
+  try {
+    const address = $('splAddress')?.value.trim() || '0x00000000';
+    const j = await felWriteBytes(address, splFileBytes, true);
+    out.textContent = `تمت كتابة SPL (${splFileBytes.length} بايت) إلى ${address}.\nSHA-256: ${splFileSha256}\n\n` + JSON.stringify(j, null, 2) + '\n\nزر "تنفيذ SPL" أصبح متاحاً بعد ظهور النطاق في الجلسة — ويتطلب تأكيداً ثانياً.';
+    log('bridge-spl-write', `SPL written to ${address}.`);
+    await refreshSessionQuiet();
+  } catch (e) { out.textContent = `فشلت كتابة SPL: ${e.message}`; log('bridge-spl-write-error', e.message); }
+});
+$('splExec')?.addEventListener('click', async () => {
+  const out = $('splResult');
+  if (!out) return;
+  out.textContent = 'جارٍ تنفيذ SPL…';
+  try {
+    const device = bridgeDeviceOrThrow();
+    const address = $('splAddress')?.value.trim() || '0x00000000';
+    if (!confirm(`تنفيذ الكود على العنوان ${address} في SRAM؟\nتأكيد ثانٍ: SPL الذي يستلم الجهاز لن يعود، وقد لا يأتي رد حالة FEL. أعد فحص FEL_VERSION بعدها.`)) throw Error('ألغى المستخدم التنفيذ.');
+    const j = await bridgeCall('/api/bridge/fel-exec', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, address, confirm: true }) });
+    bridgeSetReport(j);
+    out.textContent = JSON.stringify(j, null, 2) + '\n\nأعد فحص FEL_VERSION الآن: إذا ردّ، فالـSPL لم يستلم الجهاز؛ وإذا لم يردّ، فقد يعمل SPL أو تعطّل الجهاز — أعد إدخاله في FEL وأعد الفحص.';
+    log('bridge-spl-exec', `SPL exec at ${address}.`);
+  } catch (e) { out.textContent = `فشل تنفيذ SPL: ${e.message}\n\nإذا كانت الرسالة عن مهلة (timeout)، فقد يكون SPL يعمل فعلاً — أعد فحص FEL_VERSION قبل افتراض الفشل.`; log('bridge-spl-exec-error', e.message); }
+});
+$('bridgeCopyReport2')?.addEventListener('click', async () => {
+  const out = $('splResult');
+  if (!bridgeReport) { if (out) out.textContent = 'لا يوجد تقرير بعد. شغّل فحصاً أو قراءة أو كتابة أولاً.'; return; }
+  try { await navigator.clipboard.writeText(JSON.stringify(bridgeReport, null, 2)); if (out) out.textContent = 'تم نسخ التقرير. أرسله إلى Muse للتحليل.\n\n' + JSON.stringify(bridgeReport, null, 2); }
+  catch { if (out) out.textContent = 'تعذّر النسخ التلقائي. حدّد نص التقرير وانسخه يدوياً.\n\n' + JSON.stringify(bridgeReport, null, 2); }
+});
+
 // IMAGEWTY parser aligned with the public reference implementation's serialized structs.
 $('firmwareFile').addEventListener('change',e=>{state.firmware=e.target.files[0]||null;$('firmwareMeta').textContent=state.firmware?`File: ${state.firmware.name}\nSize: ${fmt(state.firmware.size)} bytes (${(state.firmware.size/1024**3).toFixed(3)} GiB)\nProcessing: local browser only; no upload.`:'لم يتم اختيار ملف.';$('parseFirmware').disabled=!state.firmware;$('downloadManifest').disabled=true;});
 $('parseFirmware').addEventListener('click',async()=>{
@@ -206,5 +367,5 @@ $('reviewBootCode').addEventListener('click',()=>{const code=$('bootCode').value
 
 $('askAI').addEventListener('click',async()=>{const prompt=$('aiPrompt').value.trim();if(!prompt){$('aiResult').textContent='اكتب المشكلة أو الكود أولاً.';return;}const context={extra:$('aiContext').value,device:'R69-EMCP V2.0 / H3 reported',firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,boot:state.boot};$('aiResult').textContent='ARTEMIS is analyzing…';try{const r=await fetch('/api/assistant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,context})});const j=await r.json();if(!r.ok)throw Error(j.message||j.error||'AI request failed');$('aiMode').textContent=`${j.mode} ${j.model||''}`;$('aiResult').textContent=`MODE: ${j.mode}\n\n${j.answer}\n\n${j.safety||''}`;log('assistant',`Assistant response via ${j.mode}`);}catch(e){$('aiResult').textContent=`تعذر الاتصال بالمساعد: ${e.message}\nتحقق من تشغيل خادم ARTEMIS.`;log('assistant-error',e.message);}});
 document.querySelectorAll('[data-prompt]').forEach(b=>b.addEventListener('click',()=>{$('aiPrompt').value=b.dataset.prompt;$('aiPrompt').focus();}));
-$('exportReport').addEventListener('click',()=>{const report={schema:'artemis-r69-report/v1',generatedAt:new Date().toISOString(),product:'ARTEMIS R69 v6.1',target:'SHUNJUEY R69-EMCP V2.0',mode:'READ_ONLY',device:{socExpected:'Allwinner H3',socIdExpected:'0x1680',board:'dolphin-p1',emcpReported:'SanDisk SD9DS28K-8G'},usb:state.usb?{vendorId:state.usb.vendorId,productId:state.usb.productId,felVersionRead:false}:null,firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,bootArtifacts:state.boot,logs:state.logs,safety:{felWrite:false,felExec:false,emmcWrite:false,ramPatternTest:false,recoveryImageBuilder:false,note:'No persistent writes or arbitrary execution are implemented.'}};downloadBlob(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'ARTEMIS_R69_diagnostic_report.json');$('reportPreview').textContent=JSON.stringify({generatedAt:report.generatedAt,mode:report.mode,firmwareEntries:report.firmware?.count||0,bootArtifacts:report.bootArtifacts.length,logEntries:report.logs.length,safety:report.safety},null,2);log('report','Exported diagnostic JSON report.');});
+$('exportReport').addEventListener('click',()=>{const report={schema:'artemis-r69-report/v1',generatedAt:new Date().toISOString(),product:'ARTEMIS R69 v6.1',target:'SHUNJUEY R69-EMCP V2.0',mode:'READ_ONLY',device:{socExpected:'Allwinner H3',socIdExpected:'0x1680',board:'dolphin-p1',emcpReported:'SanDisk SD9DS28K-8G'},usb:state.usb?{vendorId:state.usb.vendorId,productId:state.usb.productId,felVersionRead:false}:null,firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,bootArtifacts:state.boot,logs:state.logs,safety:{felWrite:'sram-only (bridge v2)',felExec:'sram-only, session-gated (bridge v2)',emmcWrite:false,ramPatternTest:false,recoveryImageBuilder:false,note:'No persistent writes or arbitrary execution are implemented. FEL_WRITE / FEL_EXEC are confined to H3 SRAM and require a prior write in the same bridge session.'}};downloadBlob(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'ARTEMIS_R69_diagnostic_report.json');$('reportPreview').textContent=JSON.stringify({generatedAt:report.generatedAt,mode:report.mode,firmwareEntries:report.firmware?.count||0,bootArtifacts:report.bootArtifacts.length,logEntries:report.logs.length,safety:report.safety},null,2);log('report','Exported diagnostic JSON report.');});
 fetch('/api/ai/status').then(r=>r.json()).then(j=>{document.getElementById('aiMode').textContent=j.endpointConfigured?`AI endpoint configured • ${j.model} • ${j.authentication}`:'Offline rules active — configure a no-key local model endpoint for generative AI';}).catch(()=>{document.getElementById('aiMode').textContent='AI status unavailable';});

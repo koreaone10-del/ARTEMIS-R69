@@ -2,7 +2,7 @@
   "name": "artemis-r69-v6",
   "version": "6.2.0",
   "private": false,
-  "description": "Mobile-first, read-only Allwinner H3 R69 firmware analysis with reference-layout IMAGEWTY extraction",
+  "description": "Mobile-first Allwinner H3 R69 firmware analysis with a Termux bridge (FEL read + SRAM-only FEL write/exec, no eMMC/flash write)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",
