@@ -7,8 +7,8 @@
   "scripts": {
     "start": "node backend/server.js",
     "dev": "node --watch backend/server.js",
-    "test": "node --test tests/*.test.js",
-    "check": "node --check backend/server.js && node --check lib/parsers/egon.js && node --check lib/parsers/toc1.js && node --check lib/parsers/partitions.js && node --check lib/parsers/fex.js && node --check lib/parsers/imagewty.js && node --check frontend/app.js"
+    "test": "node --test tests/*.test.js bridge/tests/*.test.js",
+    "check": "node --check backend/server.js && node --check bridge/server.js && node --check lib/parsers/egon.js && node --check lib/parsers/toc1.js && node --check lib/parsers/partitions.js && node --check lib/parsers/fex.js && node --check lib/parsers/imagewty.js && node --check frontend/app.js"
   },
   "engines": {
     "node": ">=20"

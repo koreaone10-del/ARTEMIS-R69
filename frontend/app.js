@@ -83,6 +83,63 @@ $('usbConnect').addEventListener('click',async()=>{
 });
 $('usbDisconnect').addEventListener('click',async()=>{try{if(state.usb?.opened)await state.usb.close();}catch{}state.usb=null;$('usbBadge').textContent='غير متصل';$('usbBadge').className='tag';$('usbResult').textContent='تم إنهاء جلسة فحص الواصفات.';});
 
+// Termux bridge (localhost only, read-only v1).
+// The bridge server runs on http://127.0.0.1:3001 in Termux.
+// From Render (https) this fetch cannot work: mixed content and a
+// different host. The page says so instead of faking a connection.
+const BRIDGE_BASE = 'http://127.0.0.1:3001';
+let bridgeReport = null;
+const bridgeIsLocal = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+async function bridgeCall(pathname, options) {
+  if (!bridgeIsLocal) throw Error('افتح ARTEMIS محلياً على http://127.0.0.1:3000 — صفحة الجسر لا تعمل من Render.');
+  const r = await fetch(BRIDGE_BASE + pathname, options);
+  const j = await r.json().catch(() => ({ ok: false, error: 'bad_json' }));
+  if (!r.ok) throw Error(j.message || j.error || `bridge HTTP ${r.status}`);
+  return j;
+}
+$('bridgeStatus')?.addEventListener('click', async () => {
+  const out = $('bridgeStatusResult'), badge = $('bridgeBadge');
+  if (!out) return;
+  out.textContent = 'جارٍ فحص الجسر…';
+  try {
+    const s = await bridgeCall('/api/bridge/status');
+    badge.textContent = s.usbProbeAvailable && s.felVersionAvailable ? 'الجسر يعمل' : 'الجسر يعمل — أدوات ناقصة';
+    badge.className = 'tag blue';
+    out.textContent = JSON.stringify(s, null, 2);
+    log('bridge-status', 'Bridge status checked.');
+  } catch (e) {
+    badge.textContent = 'الجسر غير مشغّل';
+    badge.className = 'tag';
+    out.textContent = `الجسر غير متاح: ${e.message}\n\nتأكد من:\n1) تشغيل bash bridge/run-bridge.sh في Termux\n2) فتح ARTEMIS من http://127.0.0.1:3000 وليس من Render\n3) أن المنفذ 3001 غير محجوب على الهاتف`;
+    log('bridge-status-error', e.message);
+  }
+});
+async function bridgeRun(pathname, label) {
+  const out = $('bridgeResult');
+  const device = $('bridgeDevice')?.value.trim();
+  if (!out) return;
+  if (!device) { out.textContent = 'أدخل مسار الجهاز من termux-usb -l أولاً، مثال: /dev/bus/usb/001/002'; return; }
+  out.textContent = `جارٍ ${label}… لا تغلق الصفحة.`;
+  try {
+    const j = await bridgeCall(pathname, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device }) });
+    bridgeReport = j;
+    out.textContent = JSON.stringify(j, null, 2);
+    log('bridge', `${label} completed for ${device}`);
+  } catch (e) {
+    bridgeReport = null;
+    out.textContent = `فشل ${label}: ${e.message}`;
+    log('bridge-error', e.message);
+  }
+}
+$('bridgeProbe')?.addEventListener('click', () => bridgeRun('/api/bridge/probe', 'فحص USB'));
+$('bridgeFelVersion')?.addEventListener('click', () => bridgeRun('/api/bridge/fel-version', 'قراءة FEL_VERSION'));
+$('bridgeCopyReport')?.addEventListener('click', async () => {
+  const out = $('bridgeResult');
+  if (!bridgeReport) { if (out) out.textContent = 'لا يوجد تقرير بعد. شغّل فحص USB أو FEL_VERSION أولاً.'; return; }
+  try { await navigator.clipboard.writeText(JSON.stringify(bridgeReport, null, 2)); if (out) out.textContent = 'تم نسخ التقرير. أرسله إلى Muse للتحليل.\n\n' + JSON.stringify(bridgeReport, null, 2); }
+  catch { if (out) out.textContent = 'تعذّر النسخ التلقائي. حدّد نص التقرير وانسخه يدوياً.\n\n' + JSON.stringify(bridgeReport, null, 2); }
+});
+
 // IMAGEWTY parser aligned with the public reference implementation's serialized structs.
 $('firmwareFile').addEventListener('change',e=>{state.firmware=e.target.files[0]||null;$('firmwareMeta').textContent=state.firmware?`File: ${state.firmware.name}\nSize: ${fmt(state.firmware.size)} bytes (${(state.firmware.size/1024**3).toFixed(3)} GiB)\nProcessing: local browser only; no upload.`:'لم يتم اختيار ملف.';$('parseFirmware').disabled=!state.firmware;$('downloadManifest').disabled=true;});
 $('parseFirmware').addEventListener('click',async()=>{

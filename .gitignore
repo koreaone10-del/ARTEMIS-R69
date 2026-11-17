@@ -3,3 +3,6 @@ node_modules/
 *.log
 .DS_Store
 coverage/
+bridge/run/
+bridge/reports/
+bridge/fel_version

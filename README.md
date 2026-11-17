@@ -49,6 +49,21 @@ npm start
 
 ملاحظة: WebUSB قد لا يعمل على localhost في بعض إصدارات Android/Chrome أو مع بعض OTG adapters. استضافة Render HTTPS لا تضمن دعم WebUSB على كل هاتف. التطبيق يبقى مفيداً لتحليل ملفات Firmware حتى دون USB.
 
+## جسر Termux (v1، قراءة فقط)
+
+للفحص المباشر لجهاز R69 في وضع FEL عبر OTG من الهاتف، دون حاسوب:
+
+```bash
+bash bridge/termux-setup.sh
+bash bridge/run-bridge.sh   # في جلسة Termux أولى: 127.0.0.1:3001
+npm start                   # في جلسة ثانية: ARTEMIS على 127.0.0.1:3000
+```
+
+ثم افتح `http://127.0.0.1:3000` وانتقل إلى **“جسر Termux”**.
+الجسر يقرأ واصفات USB و`FEL_VERSION` فقط، ولا يكتب شيئاً.
+لا يعمل من موقع Render. التفاصيل والمصادر وما هو غير مختبَر
+في [bridge/README.md](bridge/README.md) و[bridge/docs/SOURCES.md](bridge/docs/SOURCES.md).
+
 ## التشغيل على Render
 
 1. ارفع محتويات المجلد إلى مستودع GitHub جديد.
@@ -95,6 +110,11 @@ ARTEMIS_R69_v6/
 ├── samples/              # FEX samples for parser testing
 ├── docs/                 # architecture, evidence profile, sources
 ├── scripts/              # Termux install/start
+├── bridge/               # Termux bridge v1 (read-only, localhost only)
+│   ├── server.js         # Node http server on 127.0.0.1:3001
+│   ├── fel_version.c     # read-only FEL_VERSION client (GPL-2.0-or-later)
+│   ├── termux-setup.sh   # Termux install + build
+│   └── run-bridge.sh     # start the bridge server
 ├── .github/workflows/    # CI tests
 ├── Dockerfile
 ├── render.yaml
