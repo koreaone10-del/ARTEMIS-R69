@@ -44,10 +44,21 @@
  * The C tools accept the USB fd as argv[1] (v1 form), as the last
  * argv token (this form, where termux-usb appends the fd after the
  * command string), or via $TERMUX_USB_FD (-E form), and they also
- * accept FEL_ADDR / FEL_LEN / FEL_FILE from the environment. The
- * command-string form is UNVERIFIED on the user's phone; if it
- * fails, the README documents the direct Termux fallback. See
- * bridge/docs/SOURCES.md.
+ * accept FEL_ADDR / FEL_LEN / FEL_FILE from the environment.
+ * PROVEN LIVE 2026-11-17: the UNQUOTED command-string form works
+ * on this phone — both
+ *   termux-usb -r -E -e "./bridge/fel_read 0x1000 16" /dev/bus/usb/001/006
+ * and
+ *   termux-usb -r -e "./bridge/fel_read 0x1000 16" /dev/bus/usb/001/006
+ * returned identical FEL_READ JSON (address 0x1000, length 16,
+ * sha256 5b2402fa391d657a137b6d3f33ef97ff962b7d2cd5863276ae483946f3292191).
+ * The SINGLE-QUOTED form the server originally built
+ * (termux-usb -r -e "'<binary>' 0x1000 16" <device>) FAILED on
+ * this phone with "fel_read did not return JSON" — termux-usb
+ * does not strip the quotes, so the binary path was not found.
+ * The server therefore builds the command string UNQUOTED
+ * (see buildTermuxUsbCmd). A failure is reported, never faked.
+ * See bridge/docs/SOURCES.md.
  *
  * The allowlist is enforced here AND in the C tools (fel_common.h);
  * neither layer trusts the other. Protected BROM regions
@@ -311,17 +322,37 @@ function runViaTermuxUsb(binary, device, timeoutMs) {
 }
 
 /*
- * v2 form for tools that need arguments: the command is passed as
- * one string, and termux-usb appends the USB fd as the command's
- * argument (the C tools also accept the fd first, or via
- * $TERMUX_USB_FD). Only numeric / hex parameters and server-made
- * file paths are ever interpolated here; the binary and file paths
- * are single-quoted. This form is UNVERIFIED on the user's phone
- * (see the header comment); a failure is reported, never faked.
+ * Build the termux-usb command string for tools that need
+ * arguments, UNQUOTED. The single-quoted form originally used
+ * here FAILED live on the user's phone on 2026-11-17
+ * ("fel_read did not return JSON"): termux-usb does not strip
+ * the quotes, so the binary path was not resolved. The unquoted
+ * form was proven live the same day, both with -E and without,
+ * returning identical FEL_READ JSON for 0x1000 x16. See
+ * bridge/docs/SOURCES.md.
+ *
+ * Safety: only server-validated tokens are ever interpolated —
+ * a binary path, a hex address, a decimal length, a --flag, or
+ * a server-made temp file path. Every token must match the safe
+ * pattern below (letters, digits, '.', '_', '-', '/' only, plus
+ * a leading 0x for hex); anything else (whitespace, quotes,
+ * shell metacharacters, user free text) throws instead of being
+ * quoted into the command. The C tools also accept the same
+ * parameters from FEL_ADDR / FEL_LEN / FEL_FILE in the
+ * environment, which the server still passes as a fallback.
  */
+function buildTermuxUsbCmd(binary, args) {
+  const SAFE_TOKEN = /^[A-Za-z0-9._\/-]+$/;
+  for (const token of [binary, ...args]) {
+    if (typeof token !== 'string' || !SAFE_TOKEN.test(token)) {
+      throw new Error(`unsafe termux-usb command token: ${String(token)}`);
+    }
+  }
+  return [binary, ...args].join(' ');
+}
+
 function runViaTermuxUsbCmd(binary, args, device, timeoutMs, envExtra) {
-  const quoted = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-  const command = [quoted(binary), ...args].join(' ');
+  const command = buildTermuxUsbCmd(binary, args);
   return new Promise((resolve) => {
     execFile('termux-usb', ['-r', '-e', command, device],
       { timeout: timeoutMs, maxBuffer: 512 * 1024,
@@ -656,4 +687,4 @@ if (require.main === module) {
 
 module.exports = { server, handler, createServer, HOST, PORT, VERSION,
   parseAddress, parseLength, readAllowed, writeAllowed, execAllowed,
-  inSram, inSid, hexAddr, writtenRanges };
+  inSram, inSid, hexAddr, writtenRanges, buildTermuxUsbCmd };

@@ -18,7 +18,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
-const { createServer } = require('../server');
+const { createServer, buildTermuxUsbCmd } = require('../server');
 
 function startTestServer() {
   return new Promise((resolve, reject) => {
@@ -133,6 +133,36 @@ test('a non-localhost BRIDGE_HOST is refused', async () => {
   const code = await new Promise((resolve) => child.on('close', resolve));
   assert.notEqual(code, 0);
   assert.match(stderr, /refusing non-localhost binding/);
+});
+
+/* --- termux-usb command-string form (v2.1 fix) --- */
+
+test('fel-read/write/exec command string is unquoted, never single-quoted', () => {
+  // Regression test for the live failure on 2026-11-17: the server
+  // originally built "'<binary>' 0x1000 16", and termux-usb on the
+  // user's phone did not strip the quotes, so fel_read never ran
+  // ("fel_read did not return JSON"). The unquoted form was proven
+  // live the same day, both with -E and without, returning
+  // identical FEL_READ JSON for 0x1000 x16 (sha256 5b2402fa...2191).
+  assert.equal(
+    buildTermuxUsbCmd('/data/data/com.termux/files/home/ARTEMIS-R69/bridge/fel_read', ['0x00001000', '16']),
+    '/data/data/com.termux/files/home/ARTEMIS-R69/bridge/fel_read 0x00001000 16',
+  );
+  assert.equal(
+    buildTermuxUsbCmd('/x/bridge/fel_write', ['0x00000000', '/x/bridge/run/fel-write-123-5b2402fa.bin', '--spl']),
+    '/x/bridge/fel_write 0x00000000 /x/bridge/run/fel-write-123-5b2402fa.bin --spl',
+  );
+  assert.equal(
+    buildTermuxUsbCmd('/x/bridge/fel_exec', ['0x00001000', '--confirmed']),
+    '/x/bridge/fel_exec 0x00001000 --confirmed',
+  );
+  const built = buildTermuxUsbCmd('/x/bridge/fel_read', ['0x00001000', '16']);
+  assert.ok(!built.includes("'"), 'command string must contain no single quotes');
+  // Unsafe tokens are rejected, never quoted into the command.
+  for (const bad of ['0x1000; rm -rf /', "a'b", 'a b', 'a$b', 'a|b', 'a`b`', '']) {
+    assert.throws(() => buildTermuxUsbCmd('/x/bridge/fel_read', [bad]), /unsafe termux-usb command token/);
+  }
+  assert.throws(() => buildTermuxUsbCmd("/x/bridge/fel_read' ", ['0x1000']), /unsafe termux-usb command token/);
 });
 
 /* --- fel-read allowlist --- */

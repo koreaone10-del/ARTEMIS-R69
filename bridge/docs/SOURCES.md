@@ -20,10 +20,19 @@ it is presented as working.
   proven.** Bridge v1 status at that time: read-only,
   `127.0.0.1:3001`, termuxUsbAvailable / usbProbeAvailable /
   felVersionAvailable true, sunxiFelAvailable false.
-- FEL_READ / FEL_WRITE / FEL_EXEC have **never** been run on a
-  real device. Everything in v2 about them is verified from
-  source only, and is **UNVERIFIED** on hardware until the test
-  plan in bridge/README.md is run on the phone.
+- FEL_READ was proven live directly in Termux at 15:18 UTC on
+  `/dev/bus/usb/001/006` (device path had changed from `001/004`),
+  twice with identical results: address `0x1000`, length 16,
+  hex `43f0704313604bf00072ddf824c00a98`, sha256
+  `5b2402fa391d657a137b6d3f33ef97ff962b7d2cd5863276ae483946f3292191`,
+  `verified_on_device: true`. Both the `-E` form and the non-`-E`
+  form worked. The same FEL_READ through the bridge page failed
+  first (quoted command-string bug, fixed in v2.1 — see §2) and
+  has not yet been re-tested from the page.
+- FEL_WRITE / FEL_EXEC have **never** been run on a real device.
+  Everything in v2 about them is verified from source only, and
+  is **UNVERIFIED** on hardware until the test plan in
+  bridge/README.md is run on the phone.
 
 ## Verified from source
 
@@ -47,7 +56,7 @@ it is presented as working.
   Termux:API / pyusb documentation. The bridge server uses this
   `-e` argument form for probe and fel-version (v1, proven live).
 
-### 2. termux-usb `-e` with a command string — UNVERIFIED on this phone
+### 2. termux-usb `-e` with a command string — PROVEN live, unquoted only
 
 - The v2 tools (fel_read / fel_write / fel_exec) need arguments
   in addition to the fd, so the server uses the command-string
@@ -59,26 +68,42 @@ it is presented as working.
   summary of termux-api-package `scripts/termux-usb.in` stating
   the fd "is passed as argument or via `TERMUX_USB_FD`
   environment variable (with `-E` flag)".
-- Whether the fd is appended **after** the command string's
-  arguments on the user's Termux version is **UNVERIFIED**. The
-  v2 C tools therefore accept the fd in three positions: argv[1]
-  (v1 form), the last argv token (command-string form), or
-  `$TERMUX_USB_FD` (-E form); parameters can also come from
-  `FEL_ADDR` / `FEL_LEN` / `FEL_FILE` in the environment. The
-  server also passes those env vars. If the command-string form
-  fails on the phone, the README documents the direct Termux
-  fallback (`termux-usb -r -E -e "./fel_read 0x1000 16" <device>`).
+- **Proven live on the user's phone, 2026-11-17:** the UNQUOTED
+  form works, both with `-E` and without, returning identical
+  FEL_READ JSON for `0x1000` x16 on `/dev/bus/usb/001/006`:
+  `termux-usb -r -E -e "./bridge/fel_read 0x1000 16" /dev/bus/usb/001/006`
+  and `termux-usb -r -e "./bridge/fel_read 0x1000 16" /dev/bus/usb/001/006`
+  both returned `{"ok":true,"tool":"fel_read","address":4096,
+  "address_hex":"0x00001000","length":16,
+  "sha256":"5b2402fa391d657a137b6d3f33ef97ff962b7d2cd5863276ae483946f3292191",
+  "hex":"43f0704313604bf00072ddf824c00a98","verified_on_device":true}`.
+  The fd is appended after the command string's arguments (the
+  v2 C tools also accept the fd first, or via `$TERMUX_USB_FD`).
+- **The SINGLE-QUOTED form FAILED on this phone:** the v2 server
+  originally built `termux-usb -r -e "'<binary>' 0x1000 16"
+  <device>`, and the bridge page's FEL_READ failed with
+  "fel_read did not return JSON" — termux-usb does not strip the
+  quotes, so the binary path was not resolved. The v2.1 server
+  fix builds the command string unquoted
+  (`buildTermuxUsbCmd` in `bridge/server.js`, which rejects any
+  token containing whitespace, quotes or shell metacharacters
+  instead of quoting it in). Only server-validated hex addresses,
+  decimal lengths, `--flag`s and server-made temp file paths are
+  ever interpolated. The server also passes `FEL_ADDR` /
+  `FEL_LEN` / `FEL_FILE` in the environment as a fallback.
 
-### 3. termux-usb `-E` variant — UNVERIFIED
+### 3. termux-usb `-E` variant — PROVEN live on this phone
 
 - Some newer Termux:API versions / projects document
   `termux-usb -r -E -e "<command>" <device>`, where the fd is
   passed in the environment variable `$TERMUX_USB_FD` instead of
   as an argument.
 - The v2 C tools accept **both**: `argv[1]` first, then the last
-  argv token, then `$TERMUX_USB_FD`. Whether `-E` exists on the
-  user's Samsung / Termux version is **UNVERIFIED** — try it
-  manually if `-e` fails, do not assume it.
+  argv token, then `$TERMUX_USB_FD`. **Proven live 2026-11-17:**
+  `-E` exists on the user's Samsung / Termux version and the
+  `-E` FEL_READ returned the identical result quoted in §2.
+  The non-`-E` form works too, so the server (which does not
+  pass `-E`) uses the proven unquoted non-`-E` form.
 
 ### 4. Allwinner FEL protocol (sunxi-fel) — re-verified for v2
 
@@ -231,12 +256,14 @@ exec is an expected outcome, not proof of failure.
 ## Unverified on a real device
 
 - FEL_READ / FEL_WRITE / FEL_EXEC themselves (exchange order is
-  from source only).
-- Whether the `termux-usb -e "<binary> <args>"` command-string
-  form works on the user's phone, and whether the fd is appended
-  after the arguments (the C tools accept fd first, fd last, and
-  `$TERMUX_USB_FD` to cover the variants).
-- Whether `-E` exists on the user's Termux version.
+  from source only). FEL_READ was proven live directly in Termux
+  on 2026-11-17 (0x1000 x16, sha256 5b2402fa…2191); the same
+  exchange through the bridge page was blocked only by the
+  quoted command-string bug, fixed in v2.1 (see §2).
+- The `termux-usb -e "<binary> <args>"` command-string form:
+  the UNQUOTED form is proven live (§2); the single-quoted form
+  the v2 server originally built is proven to FAIL on this phone.
+  The fd is appended after the arguments, and `-E` also works.
 - Whether `libusb_claim_interface()` succeeds on a termux-usb
   wrapped handle on Samsung/Android for the new tools (it did
   for fel_version on 2026-11-17, which is encouraging but not
