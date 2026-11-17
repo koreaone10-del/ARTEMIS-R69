@@ -467,13 +467,35 @@ was found in `bridge/fel_spl_uboot.c`:
 - `read_all_file` refuses files over 2 MiB before allocating
   for them; every `malloc` is checked.
 
-**Still UNVERIFIED after v3.1:** the whole v3 flow on live
+**v3.2 changes (`bridge/fel_spl_uboot.c`, server 3.2.0) — live-run lesson from 2026-11-17:**
+- Validate-only PASSED on the phone (all 4 validation steps +
+  FEL_VERSION 0x1680/H3), but the full flow failed at
+  `egon_fel_readback` ("FEL stopped answering after the thunk")
+  with stdout entirely lost (`stdout ""`, `progress []`) while
+  stderr survived (it carried the diag line). So v3.1's
+  incremental stdout progress is not enough on this phone:
+  every JSON line the tool prints (progress, banner, final
+  result) is now emitted to stdout AND stderr (`emit_json`),
+  and the server's `parseSplUbootOutput` scans stderr lines
+  too (stdout first, progress deduped by step number), so the
+  step log and the final result survive a lost stdout.
+- The `eGON.FEL` read-back is retried 3 times, 500 ms apart,
+  before failing: FEL_VERSION itself is intermittent on this
+  phone (two identical runs returned nothing, then a third
+  succeeded), so one failed read is weak evidence FEL is dead.
+  The 250 ms post-thunk wait (upstream fel.c L1216) is
+  unchanged.
+- Bridge tests 31/31 pass in the VM (28 v3.1 + 3 new v3.2:
+  stderr recovery, dedupe, binary stderr mirror).
+
+**Still UNVERIFIED after v3.2:** the whole v3 flow on live
 hardware (swap/thunk, `eGON.FEL`, DRAM staging, U-Boot exec),
 whether the 5 s bulk timeout holds for the 64 KiB chunks, and
-whether the unquoted termux-usb command form works for this
-new binary (same form proven live for `fel_read`). The
-validate-only run is designed to answer the transport question
-before any write is attempted.
+whether FEL really dies after the thunk or only the read-back
+transport drops (the pending user check is FEL_VERSION plus a
+direct FEL_READ of 0x00000004 x8). The validate-only run is
+designed to answer the transport question before any write is
+attempted.
 
 ### 7. Timeout deviation — deliberate (v1, kept in v2 and v3)
 

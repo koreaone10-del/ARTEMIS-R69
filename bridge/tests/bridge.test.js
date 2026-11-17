@@ -599,6 +599,64 @@ test('v3.1: parseSplUbootOutput extracts progress lines, banner, and the last li
   assert.equal(silent.banner.file_size, 559480);
 });
 
+/* --- v3.2: stderr mirror + read-back retry --- */
+
+test('v3.2: parseSplUbootOutput recovers progress, banner and final from stderr when stdout is lost', () => {
+  // The phone run on 2026-11-17: stdout "" while stderr survived
+  // (it carried the egon_fel_readback diag). With v3.2 the tool
+  // mirrors every JSON line to stderr, so the step log must be
+  // recoverable from stderr alone.
+  const mirrored = [
+    '{"progress":true,"step":0,"name":"validate_file_size","ok":true,"detail":"size 559480 bytes, sha256 x"}',
+    '{"progress":true,"step":4,"name":"validate_uboot_header","ok":true,"detail":"mkimage header ok"}',
+    '{"banner":true,"tool":"fel_spl_uboot","file_size":559480,"validate_only":false}',
+    '{"ok":false,"tool":"fel_spl_uboot","version":1,"steps":[{"step":0,"name":"validate_file_size","ok":true,"detail":"size 559480 bytes, sha256 x"}],"error":"SPL: could not read back the SPL header (FEL stopped answering after the thunk, 3 attempts)"}',
+  ].join('\n');
+  const run = {
+    stdout: '',
+    stderr: 'fel_spl_uboot: step=egon_fel_readback failed: FEL_READ of SPL header failed after 3 attempts (FEL stopped answering after the thunk)\n' + mirrored + '\n',
+  };
+  const { final, progress, banner } = parseSplUbootOutput(run);
+  assert.equal(progress.length, 2);
+  assert.deepEqual(progress.map((p) => p.name), ['validate_file_size', 'validate_uboot_header']);
+  assert.equal(banner.file_size, 559480);
+  assert.equal(final.ok, false);
+  assert.match(final.error, /3 attempts/);
+});
+
+test('v3.2: parseSplUbootOutput dedupes progress lines present in both stdout and stderr', () => {
+  const line = '{"progress":true,"step":0,"name":"validate_file_size","ok":true,"detail":"size 559480 bytes"}';
+  const { progress, final } = parseSplUbootOutput({ stdout: line + '\n', stderr: line + '\n' });
+  assert.equal(progress.length, 1);
+  assert.equal(final, null);
+});
+
+test('v3.2: fel_spl_uboot --validate-only mirrors progress lines and the final result to stderr', () => {
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const data = makeValidUbootImage();
+  const tmp = path.join(__dirname, 'tmp-v32-validate.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const bin = path.join(__dirname, '..', 'fel_spl_uboot');
+    if (!fs.existsSync(bin)) return; // binary not built in this checkout
+    const r = spawnSync(bin, ['--validate-only', '3', tmp], { encoding: 'utf8', timeout: 10000, env: process.env });
+    const errParsed = r.stderr.split('\n').map((l) => l.trim()).filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const errProgress = errParsed.filter((o) => o.progress === true);
+    assert.equal(errProgress.length, 4, 'four validation steps mirrored to stderr');
+    assert.deepEqual(errProgress.map((p) => p.name), [
+      'validate_file_size', 'validate_egon_header',
+      'validate_egon_checksum', 'validate_uboot_header',
+    ]);
+    // Progress lines also carry an "ok" field, so the final result
+    // is the "ok" object with neither the progress nor banner flag.
+    const errFinal = errParsed.find((o) => typeof o.ok === 'boolean' && !o.progress && !o.banner);
+    assert.ok(errFinal, 'final result mirrored to stderr');
+    assert.equal(errFinal.validate_only, true);
+  } finally { fs.unlinkSync(tmp); }
+});
+
 test('v3.1: fel-spl-uboot validate_only:true is accepted and records no session write', async () => {
   const { server, base } = await startTestServer();
   try {

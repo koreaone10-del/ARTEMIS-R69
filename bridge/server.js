@@ -1,10 +1,16 @@
 'use strict';
 /*
- * ARTEMIS Termux bridge server -- v3.1, SRAM-only FEL read/write/exec
+ * ARTEMIS Termux bridge server -- v3.2, SRAM-only FEL read/write/exec
  * plus upstream-style SPL + U-Boot staging (fel_spl_uboot).
  * v3.1: fel_spl_uboot prints incremental progress lines (v3 printed
  * nothing on the phone on 2026-11-17) and fel-spl-uboot accepts
  * validate_only:true — run that first, before the full flow.
+ * v3.2: fel_spl_uboot mirrors every JSON line to stderr too and
+ * retries the eGON.FEL read-back 3 times — on 2026-11-17 the full
+ * flow's stdout was lost entirely while stderr survived, and the
+ * single read-back attempt failed though FEL_VERSION itself is
+ * intermittent on this phone. parseSplUbootOutput now reads
+ * progress/banner/final from stderr as well.
  *
  * Binds 127.0.0.1:3001 only. There is NO eMMC / flash / NAND write
  * endpoint, and there never will be one on this server: FEL_WRITE
@@ -107,7 +113,7 @@ const FEL_READ_BIN = path.join(BRIDGE_DIR, 'fel_read');
 const FEL_WRITE_BIN = path.join(BRIDGE_DIR, 'fel_write');
 const FEL_EXEC_BIN = path.join(BRIDGE_DIR, 'fel_exec');
 const FEL_SPL_UBOOT_BIN = path.join(BRIDGE_DIR, 'fel_spl_uboot');
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 
 const HOST = '127.0.0.1';
 if (process.env.BRIDGE_HOST && process.env.BRIDGE_HOST !== HOST) {
@@ -483,20 +489,33 @@ function parseToolJson(run) {
  * JSON object with an "ok" field and neither flag. Returns
  * { final, progress, banner } with final null when no result line
  * was printed (the v3 silent-failure case — the progress lines
- * are then the only diagnosis, and they are returned too). */
+ * are then the only diagnosis, and they are returned too).
+ * v3.2: the C tool mirrors every JSON line to stderr as well,
+ * because on the phone on 2026-11-17 the full flow's stdout was
+ * lost entirely (stdout "", progress []) while stderr survived.
+ * This parser therefore scans stderr lines too (stdout first,
+ * so a stdout line always wins), deduping progress lines by
+ * step number — the same step appears once per stream. */
 function parseSplUbootOutput(run) {
   const progress = [];
+  const seenSteps = new Set();
   let banner = null;
   let final = null;
-  for (const line of String(run.stdout || '').split(/\r?\n/)) {
-    const t = line.trim();
-    if (!t.startsWith('{')) continue;
-    let obj;
-    try { obj = JSON.parse(t); } catch { continue; }
-    if (obj && obj.progress === true) { progress.push(obj); continue; }
-    if (obj && obj.banner === true) { banner = obj; continue; }
-    if (obj && typeof obj.ok === 'boolean') final = obj;
+  for (const text of [run.stdout || '', run.stderr || '']) {
+    for (const line of String(text).split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t.startsWith('{')) continue;
+      let obj;
+      try { obj = JSON.parse(t); } catch { continue; }
+      if (obj && obj.progress === true) {
+        if (!seenSteps.has(obj.step)) { seenSteps.add(obj.step); progress.push(obj); }
+        continue;
+      }
+      if (obj && obj.banner === true) { if (!banner) banner = obj; continue; }
+      if (obj && typeof obj.ok === 'boolean' && !final) final = obj;
+    }
   }
+  progress.sort((a, b) => (a.step || 0) - (b.step || 0));
   return { final, progress, banner };
 }
 
@@ -542,7 +561,7 @@ function statusBody() {
     sunxiFelAvailable: commandExists('sunxi-fel'),
     writtenRanges: writtenRanges.length,
     latestReport: latestReport() ? { exists: true, generatedAt: latestReport().generatedAt || null } : { exists: false },
-    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.1: fel_spl_uboot prints one progress JSON line per step immediately (the v3 tool printed nothing on the phone on 2026-11-17), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first.',
+    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.2: fel_spl_uboot mirrors every progress/final JSON line to stderr too and retries the eGON.FEL read-back 3 times (on 2026-11-17 the full flow stdout was lost entirely while stderr survived, and the single read-back attempt failed though FEL_VERSION itself is intermittent on this phone), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first.',
   };
 }
 

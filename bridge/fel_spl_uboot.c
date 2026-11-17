@@ -92,10 +92,14 @@
  * exactly one JSON object to stdout, including a per-step log.
  * v3.1 ALSO prints one progress JSON line per step, immediately,
  * plus a banner line after validation, so a later crash or kill
- * still leaves the completed steps visible. Parse stdout by
- * lines: progress lines have "progress":true, the banner has
- * "banner":true, and the LAST line is the final result object
- * ({"ok":...}).
+ * still leaves the completed steps visible. v3.2 mirrors every
+ * JSON line (progress, banner, final result) to stderr as well,
+ * and retries the eGON.FEL read-back 3 times: on the phone on
+ * 2026-11-17 the full flow's stdout was lost entirely while
+ * stderr survived, and FEL_VERSION itself is intermittent
+ * there. Parse stdout (or stderr) by lines: progress lines have
+ * "progress":true, the banner has "banner":true, and the LAST
+ * line is the final result object ({"ok":...}).
  *
  * Safety: H3 only (soc_id 0x1680, verified live via FEL_VERSION
  * before any write). SPL is written only to SRAM 0x00000000 with
@@ -105,17 +109,25 @@
  * never returns a FEL status; that is reported as
  * "uboot_exec_sent, no FEL reply expected", not as a failure.
  *
- * UNVERIFIED ON A REAL R69 (2026-11-17): this program has never
- * been run against a live H3 in FEL mode. The exchange order,
- * swap table, thunk bytes, MMU handling and eGON checks are all
- * verified against fel.c source only. A live run is the only
- * proof. See bridge/README.md for the phone test plan.
+ * LIVE RUN 2026-11-17 (v3.1): validate-only passed on the phone
+ * (all 4 validation steps + FEL_VERSION 0x1680/H3), but the full
+ * flow failed at egon_fel_readback — "FEL_READ of SPL header
+ * failed (FEL stopped answering after the thunk)" — with stdout
+ * entirely lost (empty stdout, progress []) and only the stderr
+ * diag surviving. Whether FEL really died or the transport
+ * dropped the read is still open: FEL_VERSION is intermittent
+ * on this phone. v3.2 answers exactly that (stderr mirror +
+ * 3-attempt read-back). The exchange order, swap table, thunk
+ * bytes, MMU handling and eGON checks are verified against fel.c
+ * source only; no run has yet returned eGON.FEL. See
+ * bridge/README.md for the phone test plan.
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "fel_common.h"
@@ -184,7 +196,9 @@ static const uint32_t FEL_TO_SPL_THUNK[] = {
  * progress JSON object (fflush), and stdout is unbuffered (see
  * main), so a crash/kill later in the flow cannot erase the steps
  * that already completed. The final JSON (with the full steps
- * array) is still printed as the last line. */
+ * array) is still printed as the last line.
+ * v3.2: emit_json mirrors every line to stderr too (see above):
+ * the phone lost the full flow's stdout entirely on 2026-11-17. */
 static char g_steps[16384];
 static size_t g_steps_len = 0;
 static int g_nsteps = 0;
@@ -198,6 +212,29 @@ static void diag(const char *step, const char *reason)
 {
     fprintf(stderr, "fel_spl_uboot: step=%s failed: %s\n",
             step ? step : "?", reason ? reason : "");
+    fflush(stderr);
+}
+
+/* v3.2: emit one JSON line to stdout AND stderr. On the phone on
+ * 2026-11-17 the full flow's stdout was lost entirely (the bridge
+ * reported stdout "" and progress []), while stderr survived (it
+ * carried the egon_fel_readback diag) — so stdout alone cannot be
+ * trusted for the long flow. Every JSON line this tool prints
+ * (progress, banner, final result) therefore goes to both
+ * streams; the server parses progress/banner/final from either.
+ * stderr is never parsed as the JSON channel, so the mirror
+ * cannot corrupt the result. In a plain terminal each line
+ * appears twice; that is cosmetic and worth the diagnosis. */
+static void emit_json(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
     fflush(stderr);
 }
 
@@ -228,10 +265,11 @@ static void step_log(const char *name, int ok, const char *detail)
     }
     /* v3.1: print the step immediately, so it survives a later
      * crash/kill. This line is a progress line, not the final
-     * result; parsers must take the LAST line as the result. */
-    printf("{\"progress\":true,\"step\":%d,\"name\":\"%s\",\"ok\":%s,\"detail\":\"%s\"}\n",
-           g_nsteps, name, ok ? "true" : "false", esc);
-    fflush(stdout);
+     * result; parsers must take the LAST line as the result.
+     * v3.2: emit_json mirrors it to stderr too — on the phone
+     * the full flow's stdout was lost entirely on 2026-11-17. */
+    emit_json("{\"progress\":true,\"step\":%d,\"name\":\"%s\",\"ok\":%s,\"detail\":\"%s\"}\n",
+              g_nsteps, name, ok ? "true" : "false", esc);
     g_nsteps++;
 }
 
@@ -240,14 +278,13 @@ static int fail_json(const char *tool, const char *error,
 {
     char esc[512];
     json_escape_into(esc, sizeof(esc), error);
-    printf("{\"ok\":false,\"tool\":\"%s\",\"version\":1,"
-           "\"validate_only\":%s,"
-           "\"file_sha256\":\"%s\",\"file_size\":%u,"
-           "\"steps\":[%s],\"error\":\"%s\"}\n",
-           tool, g_validate_only ? "true" : "false",
-           file_sha ? file_sha : "", file_size,
-           g_steps, esc);
-    fflush(stdout);
+    emit_json("{\"ok\":false,\"tool\":\"%s\",\"version\":1,"
+              "\"validate_only\":%s,"
+              "\"file_sha256\":\"%s\",\"file_size\":%u,"
+              "\"steps\":[%s],\"error\":\"%s\"}\n",
+              tool, g_validate_only ? "true" : "false",
+              file_sha ? file_sha : "", file_size,
+              g_steps, esc);
     return 1;
 }
 
@@ -641,14 +678,13 @@ int main(int argc, char **argv)
      * access. If the phone run shows this line and nothing after
      * it, the tool died opening the device or in the FEL_VERSION
      * exchange — not in file validation. */
-    printf("{\"banner\":true,\"tool\":\"%s\",\"file_size\":%u,"
-           "\"file_sha256\":\"%s\",\"spl_len\":%u,\"spl_sha256\":\"%s\","
-           "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\","
-           "\"uboot_size\":%u,\"validate_only\":%s}\n",
-           tool, (unsigned)file_len, file_sha,
-           spl_len, spl_sha, uboot_load, uboot_ep, uboot_size,
-           g_validate_only ? "true" : "false");
-    fflush(stdout);
+    emit_json("{\"banner\":true,\"tool\":\"%s\",\"file_size\":%u,"
+              "\"file_sha256\":\"%s\",\"spl_len\":%u,\"spl_sha256\":\"%s\","
+              "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\","
+              "\"uboot_size\":%u,\"validate_only\":%s}\n",
+              tool, (unsigned)file_len, file_sha,
+              spl_len, spl_sha, uboot_load, uboot_ep, uboot_size,
+              g_validate_only ? "true" : "false");
 
     /* ---- open the device, prove FEL is alive, H3 only ---- */
     if (fel_open(fd, &dev, err, sizeof(err)) != 0) {
@@ -865,16 +901,34 @@ int main(int argc, char **argv)
         /* ---- eGON.FEL read-back, fel.c L1219-1225 ---- */
         {
             unsigned char sig[8];
-            char d[128];
-            if (fel_read_mem(&dev, H3_SPL_ADDR + 4, sig, sizeof(sig)) != 0) {
-                diag("egon_fel_readback", "FEL_READ of SPL header failed (FEL stopped answering after the thunk)");
+            char d[192];
+            /* v3.2: retry the read-back (3 attempts, 500 ms apart)
+             * before declaring FEL dead. On the phone on 2026-11-17
+             * the single attempt failed with "FEL stopped answering
+             * after the thunk" — but FEL_VERSION itself is
+             * intermittent on this phone (two identical runs
+             * returned nothing, then a third succeeded), so one
+             * failed read is weak evidence that FEL is gone. A
+             * retry distinguishes a dropped transport run from a
+             * truly dead FEL. The 250 ms wait above is upstream
+             * fel.c L1216 and is unchanged. */
+            int attempt, read_ok = 0;
+            for (attempt = 1; attempt <= 3; attempt++) {
+                if (fel_read_mem(&dev, H3_SPL_ADDR + 4, sig, sizeof(sig)) == 0) {
+                    read_ok = 1;
+                    break;
+                }
+                if (attempt < 3) usleep(500000);
+            }
+            if (!read_ok) {
+                diag("egon_fel_readback", "FEL_READ of SPL header failed after 3 attempts (FEL stopped answering after the thunk)");
                 snprintf(g_error, sizeof(g_error), "%s",
-                         "SPL: could not read back the SPL header (FEL stopped answering after the thunk)");
+                         "SPL: could not read back the SPL header (FEL stopped answering after the thunk, 3 attempts)");
                 g_failed = 1;
                 goto out;
             }
-            snprintf(d, sizeof(d), "header at 0x00000004 reads '%c%c%c%c%c%c%c%c'",
-                     sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], sig[6], sig[7]);
+            snprintf(d, sizeof(d), "header at 0x00000004 reads '%c%c%c%c%c%c%c%c' (attempt %d of 3)",
+                     sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], sig[6], sig[7], attempt);
             STEP("egon_fel_readback", memcmp(sig, "eGON.FEL", 8) == 0, d);
             CHECK(memcmp(sig, "eGON.FEL", 8) == 0,
                   "SPL: failure code in header (expected eGON.FEL, fel.c L1221)");
@@ -971,42 +1025,40 @@ out:
     if (g_validate_only) {
         /* Validate-only success: no SPL/U-Boot flow ran, so there
          * is no eGON.FEL and no U-Boot exec to report. */
-        printf("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
-               "\"validate_only\":true,"
-               "\"file_sha256\":\"%s\",\"file_size\":%u,"
-               "\"spl_len\":%u,\"spl_sha256\":\"%s\","
-               "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\",\"uboot_size\":%u,"
-               "\"soc_id\":\"0x%04x\","
-               "\"bulk_ep_out\":%d,\"bulk_ep_in\":%d,"
-               "\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"verified_on_device\":true,"
-               "\"steps\":[%s],"
-               "\"note\":\"Validate-only: file validation + FEL_VERSION/soc check passed; no write or exec was performed.\"}\n",
-               tool, file_sha, (unsigned)file_len,
-               spl_len, spl_sha,
-               uboot_load, uboot_ep, uboot_size,
-               soc_id_checked,
-               dev.bulk_ep_out, dev.bulk_ep_in, dev.vid, dev.pid,
-               g_steps);
-        fflush(stdout);
+        emit_json("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
+                  "\"validate_only\":true,"
+                  "\"file_sha256\":\"%s\",\"file_size\":%u,"
+                  "\"spl_len\":%u,\"spl_sha256\":\"%s\","
+                  "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\",\"uboot_size\":%u,"
+                  "\"soc_id\":\"0x%04x\","
+                  "\"bulk_ep_out\":%d,\"bulk_ep_in\":%d,"
+                  "\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"verified_on_device\":true,"
+                  "\"steps\":[%s],"
+                  "\"note\":\"Validate-only: file validation + FEL_VERSION/soc check passed; no write or exec was performed.\"}\n",
+                  tool, file_sha, (unsigned)file_len,
+                  spl_len, spl_sha,
+                  uboot_load, uboot_ep, uboot_size,
+                  soc_id_checked,
+                  dev.bulk_ep_out, dev.bulk_ep_in, dev.vid, dev.pid,
+                  g_steps);
         free(file);
         if (dev_open) fel_close(&dev);
         return rc;
     }
-    printf("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
-           "\"file_sha256\":\"%s\",\"file_size\":%u,"
-           "\"spl_len\":%u,\"spl_sha256\":\"%s\","
-           "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\",\"uboot_size\":%u,"
-           "\"egon_fel\":true,\"uboot_exec_sent\":true,"
-           "\"bulk_ep_out\":%d,\"bulk_ep_in\":%d,"
-           "\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"verified_on_device\":true,"
-           "\"steps\":[%s],"
-           "\"note\":\"U-Boot proper staged in DRAM and executed; it may never return a FEL status. Re-check FEL_VERSION: a reply means U-Boot did not take over.\"}\n",
-           tool, file_sha, (unsigned)file_len,
-           spl_len, spl_sha,
-           uboot_load, uboot_load, uboot_size,
-           dev.bulk_ep_out, dev.bulk_ep_in, dev.vid, dev.pid,
-           g_steps);
-    fflush(stdout);
+    emit_json("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
+              "\"file_sha256\":\"%s\",\"file_size\":%u,"
+              "\"spl_len\":%u,\"spl_sha256\":\"%s\","
+              "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\",\"uboot_size\":%u,"
+              "\"egon_fel\":true,\"uboot_exec_sent\":true,"
+              "\"bulk_ep_out\":%d,\"bulk_ep_in\":%d,"
+              "\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"verified_on_device\":true,"
+              "\"steps\":[%s],"
+              "\"note\":\"U-Boot proper staged in DRAM and executed; it may never return a FEL status. Re-check FEL_VERSION: a reply means U-Boot did not take over.\"}\n",
+              tool, file_sha, (unsigned)file_len,
+              spl_len, spl_sha,
+              uboot_load, uboot_load, uboot_size,
+              dev.bulk_ep_out, dev.bulk_ep_in, dev.vid, dev.pid,
+              g_steps);
     free(file);
     if (dev_open) fel_close(&dev);
     return rc;
