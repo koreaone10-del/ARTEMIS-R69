@@ -46,6 +46,21 @@ corrected in v3 (§5, §6).
   `93a6594f99e0c9eeecce69137b536c238e90b46e7d99db725a99873085007fc8`.
   The full FEL loop (probe, FEL_VERSION, FEL_READ, FEL_WRITE,
   read-back) is proven live via the bridge page.
+- **LIVE 2026-11-17: the v3 SPL + U-Boot run printed NOTHING.**
+  Via the bridge page: `fel_spl_uboot_bad_output`, stdout empty,
+  stderr only locale warnings, no steps. Direct in Termux
+  (`termux-usb -r -E -e "./bridge/fel_spl_uboot
+  /data/data/com.termux/files/home/uboot-full.bin"
+/dev/bus/usb/001/002"`): also no output at all. The binary
+  exists (30,632 bytes), prints usage JSON with no arguments,
+  and the file copy was verified (559,480 bytes, SHA-256
+  `8c70a180…ece071`). FEL was alive (FEL_VERSION succeeded
+  before and after). FEL_VERSION itself was intermittent in
+  the same session: success, then twice no output at all from
+  the identical command, then success again. See §6b for the
+  audit finding and the v3.1 fix (incremental progress lines,
+  banner, `--validate-only`, stderr diagnostics, buffers off
+  the stack).
 - **LIVE 2026-11-17: the v2 raw SPL write KILLED FEL.** A v2
   `fel_write` of 32768 bytes to `0x00000000` (spl-only.bin, SHA-256
   `5979cc33…`) failed with "fel_write did not return JSON", and
@@ -361,6 +376,104 @@ deprecated in v3; SPL upload must go through
 flow above. The pattern test (28 bytes at `0x1000`,
 read-back SHA-256 match, proven live 2026-11-17) still uses
 the v2 tools and must pass first.
+
+### 6b. v3 silent failure on the phone (2026-11-17) — and v3.1
+
+**Evidence.** The v3 run via the bridge page failed with
+`fel_spl_uboot_bad_output`: `fel_spl_uboot` did not return
+JSON, stdout empty, stderr only the two `setlocale` warnings,
+no steps at all. The direct Termux run then failed the same
+way:
+`termux-usb -r -E -e "./bridge/fel_spl_uboot
+/data/data/com.termux/files/home/uboot-full.bin"
+/dev/bus/usb/001/002` — also no output at all, prompt
+returned. But the binary exists (30,632 bytes, `-rwx------`,
+17:39), running it with no arguments prints the usage JSON
+correctly, and the file copy was verified on the phone
+(559,480 bytes, SHA-256
+`8c70a1809803b0bc22ba74217bb95312701c55ce1fb18342d08b5cf655ece071`).
+FEL was alive: FEL_VERSION succeeded immediately before the
+direct run, and again after it.
+
+**FEL_VERSION is intermittent on this phone.** In the same
+session, the identical FEL_VERSION command succeeded, then
+produced NO output at all on the next two runs, then succeeded
+again with `AWUSBFEX` / `0x1680` / H3. `fel_version` prints a
+single JSON object at the end (no fflush before return, stdout
+fully buffered when piped), so a dropped run cannot be told
+apart from a tool crash by its output — the transport itself
+(termux-usb / Termux:API / Android USB permission race) can
+lose a whole run's output, even for a short, proven tool.
+
+**Audit finding (v3.1, 2026-11-17).** No deterministic crash
+was found in `bridge/fel_spl_uboot.c`:
+- In the VM the compiled v3 binary, run against the real
+  `u-boot-sunxi-with-spl.bin` with a bad fd, prints all four
+  validation steps plus a `fel_open` failure JSON (exit 1),
+  and with no arguments prints the usage JSON (exit 2).
+- No buffer overflow was found: every stack buffer is sized
+  correctly (`code[12/24/36/48]`, `raw[16384]`, `tt[4096]`,
+  `thunk` buffer `malloc` + `CHECK`), the SPL piece-write loop
+  is bounded by `remaining`, the MMU table loops are bounded
+  (`0..4095`, DRAM sections `1024..3071`), the eGON length is
+  checked before the checksum reads the SPL, and the U-Boot
+  header reads are guarded by `rem > HEADER_SIZE`. The thunk
+  loop `i <= H3_NSWAP` is CORRECT — it must include the
+  `{0,0,0}` terminator entry.
+- The one real latent risk found was stack depth: `tt[4096]`
+  (16 KiB) in `main`, nested under `raw[16384]` (16 KiB) in
+  `backup_and_disable_mmu` / `restore_and_enable_mmu` — ~32 KiB
+  plus frames, inside a process spawned by Termux:API whose
+  stack limits are not documented. v3.1 moves both to static
+  storage.
+- The diagnosability defect, which is certain: v3 built its
+  step log in memory (`g_steps`) and printed JSON **only at
+  the end**, and stdout was fully buffered (a pipe through
+  termux-usb), so ANY kill, crash, or lost stdout at any point
+  — including after all four validation steps had already
+  passed — produced exactly the observed silence. That is the
+  bug v3.1 fixes, not a specific crash.
+
+**v3.1 changes (`bridge/fel_spl_uboot.c`, server 3.1.0):**
+- Every `STEP()` also prints a one-line progress JSON object
+  immediately (`{"progress":true,"step":N,"name":"...","ok":...,"detail":"..."}`)
+  with `fflush(stdout)`, and `main` sets stdout unbuffered
+  (`setvbuf(stdout, NULL, _IONBF, 0)`).
+- A banner line is printed after file validation and before
+  any device access (`{"banner":true,...,"spl_len":...,"uboot_load":"0x4a000000",...}`).
+  If a phone run shows the banner and nothing after it, the
+  tool died opening the device or in the FEL_VERSION exchange.
+- `--validate-only` (also `FEL_VALIDATE_ONLY=1`): validates
+  the file, opens the device, checks FEL_VERSION/soc, then
+  exits with a `validate_only:true` result WITHOUT any write
+  or exec. Server: `validate_only:true` on
+  `POST /api/bridge/fel-spl-uboot` (10 s timeout, no session
+  write recorded). Frontend: a "Validate only" button in the
+  v3 panel plus a live progress box rendering the incremental
+  lines. **Test plan: validate-only FIRST, from the page, and
+  report its output; only then the full flow.**
+- Failure paths print a short stderr diagnostic
+  (`fel_spl_uboot: step=<name> failed: <reason>`), flushed,
+  for `fel_open`, FEL_VERSION, and every
+  `fel_write_mem` / `fel_exec_mem` / `fel_read_mem` failure in
+  the SPL / thunk / MMU / staging steps.
+- The server parses multi-line tool output
+  (`parseSplUbootOutput`): progress lines, banner, and the
+  final result as the LAST line — the old whole-stdout
+  `JSON.parse` would have failed on v3.1 output. The response
+  carries `progress` (and `banner`) alongside `steps` /
+  `detail.steps`, so progress survives even a missing final
+  JSON.
+- `read_all_file` refuses files over 2 MiB before allocating
+  for them; every `malloc` is checked.
+
+**Still UNVERIFIED after v3.1:** the whole v3 flow on live
+hardware (swap/thunk, `eGON.FEL`, DRAM staging, U-Boot exec),
+whether the 5 s bulk timeout holds for the 64 KiB chunks, and
+whether the unquoted termux-usb command form works for this
+new binary (same form proven live for `fel_read`). The
+validate-only run is designed to answer the transport question
+before any write is attempted.
 
 ### 7. Timeout deviation — deliberate (v1, kept in v2 and v3)
 

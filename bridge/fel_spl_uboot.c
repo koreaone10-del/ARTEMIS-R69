@@ -1,6 +1,39 @@
 /*
  * fel_spl_uboot.c -- upstream-style Allwinner FEL SPL + U-Boot loader
- * (ARTEMIS Termux bridge v3)
+ * (ARTEMIS Termux bridge v3.1)
+ *
+ * v3.1 (2026-11-17): the v3 tool printed NOTHING on the user's
+ * phone — neither via the bridge page nor via a direct Termux run
+ * (fel_spl_uboot_bad_output, empty stdout, only locale warnings
+ * on stderr) — and FEL_VERSION itself was intermittent on that
+ * phone (same command: success, then twice no output at all, then
+ * success again). Audit finding (see bridge/docs/SOURCES.md §6):
+ * no deterministic crash was found in the validation / fel_open
+ * paths — in the VM the v3 binary prints all four validation
+ * steps plus a fel_open failure for a bad fd — and no buffer
+ * overflow was found (all stack buffers are sized correctly, the
+ * thunk loop i<=H3_NSWAP is correct because it must include the
+ * {0,0,0} terminator). The silent death is therefore most likely
+ * a device-side hang/kill or a lost stdout in the termux-usb /
+ * Termux:API path, made undiagnosable by the v3 design: the step
+ * log was built in memory and printed ONLY at the end, and stdout
+ * was fully buffered (a pipe), so a kill at any point lost every
+ * step, including the four validation steps that had already
+ * passed. v3.1 fixes the diagnosability, not a specific crash:
+ *   - every STEP() also prints a one-line progress JSON object
+ *     immediately and fflush(stdout);
+ *   - stdout is set unbuffered (setvbuf _IONBF) at startup;
+ *   - a banner line is printed after file validation, before
+ *     touching the device;
+ *   - --validate-only (or FEL_VALIDATE_ONLY=1) validates the
+ *     file + FEL_VERSION/soc check and exits without any
+ *     write/exec, isolating tool crashes from device failures;
+ *   - failure paths print a short "step=... failed: ..." line
+ *     to stderr;
+ *   - the 16 KiB MMU table and the 16 KiB raw MMU buffers are
+ *     moved off the stack (static storage) — the largest latent
+ *     stack-overflow risk in v3 (tt[4096] in main + raw[16384]
+ *     nested inside backup/restore).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (C) 2026 ARTEMIS R69 project contributors
@@ -46,10 +79,23 @@
  *   # or, with -E:
  *   TERMUX_USB_FD=<fd> ./bridge/fel_spl_uboot /path/file
  *   FEL_FILE=/path/file ./bridge/fel_spl_uboot <fd>
+ *   ./bridge/fel_spl_uboot --validate-only /path/file
+ *     (or FEL_VALIDATE_ONLY=1): validate the file, open the
+ *     device and check FEL_VERSION/soc, then exit WITHOUT any
+ *     write or exec. Use this first on the phone: if it prints
+ *     validation steps + a fel_open/FEL_VERSION result, the tool
+ *     and the transport work and a later silence is a
+ *     device-side failure during the flow, not a tool crash.
  *
  * The program takes a USB file descriptor (argv[1], last argv
  * token, or $TERMUX_USB_FD) and one file argument, and prints
  * exactly one JSON object to stdout, including a per-step log.
+ * v3.1 ALSO prints one progress JSON line per step, immediately,
+ * plus a banner line after validation, so a later crash or kill
+ * still leaves the completed steps visible. Parse stdout by
+ * lines: progress lines have "progress":true, the banner has
+ * "banner":true, and the LAST line is the final result object
+ * ({"ok":...}).
  *
  * Safety: H3 only (soc_id 0x1680, verified live via FEL_VERSION
  * before any write). SPL is written only to SRAM 0x00000000 with
@@ -133,10 +179,27 @@ static const uint32_t FEL_TO_SPL_THUNK[] = {
 };
 #define THUNK_WORDS (sizeof(FEL_TO_SPL_THUNK) / sizeof(uint32_t))
 
-/* ---------- step log (JSON, built in memory, printed once) ---------- */
+/* ---------- step log (JSON, built in memory, printed once) ----------
+ * v3.1: every step is ALSO printed immediately as a one-line
+ * progress JSON object (fflush), and stdout is unbuffered (see
+ * main), so a crash/kill later in the flow cannot erase the steps
+ * that already completed. The final JSON (with the full steps
+ * array) is still printed as the last line. */
 static char g_steps[16384];
 static size_t g_steps_len = 0;
 static int g_nsteps = 0;
+static int g_validate_only = 0;
+
+/* Short stderr diagnostic for a failed step. stderr is NOT the
+ * JSON channel, so a line here can never corrupt the final JSON;
+ * it is the only trace left if the process is killed right after
+ * the failure. */
+static void diag(const char *step, const char *reason)
+{
+    fprintf(stderr, "fel_spl_uboot: step=%s failed: %s\n",
+            step ? step : "?", reason ? reason : "");
+    fflush(stderr);
+}
 
 static void json_escape_into(char *dst, size_t dst_len, const char *src)
 {
@@ -163,6 +226,12 @@ static void step_log(const char *name, int ok, const char *detail)
         memcpy(g_steps + g_steps_len, tmp, n + 1);
         g_steps_len += n;
     }
+    /* v3.1: print the step immediately, so it survives a later
+     * crash/kill. This line is a progress line, not the final
+     * result; parsers must take the LAST line as the result. */
+    printf("{\"progress\":true,\"step\":%d,\"name\":\"%s\",\"ok\":%s,\"detail\":\"%s\"}\n",
+           g_nsteps, name, ok ? "true" : "false", esc);
+    fflush(stdout);
     g_nsteps++;
 }
 
@@ -172,9 +241,11 @@ static int fail_json(const char *tool, const char *error,
     char esc[512];
     json_escape_into(esc, sizeof(esc), error);
     printf("{\"ok\":false,\"tool\":\"%s\",\"version\":1,"
+           "\"validate_only\":%s,"
            "\"file_sha256\":\"%s\",\"file_size\":%u,"
            "\"steps\":[%s],\"error\":\"%s\"}\n",
-           tool, file_sha ? file_sha : "", file_size,
+           tool, g_validate_only ? "true" : "false",
+           file_sha ? file_sha : "", file_size,
            g_steps, esc);
     fflush(stdout);
     return 1;
@@ -194,6 +265,14 @@ static unsigned char *read_all_file(const char *path, size_t *out_len)
     unsigned char *buf;
     if (!in)
         return NULL;
+    /* v3.1: refuse oversize files BEFORE allocating/growing a
+     * buffer for them (a multi-MiB file must not be read fully
+     * just to be refused by the caller afterwards). */
+    if (fseek(in, 0, SEEK_END) == 0) {
+        long sz = ftell(in);
+        if (sz < 0 || (uint64_t)sz > UB_MAX_FILE) { fclose(in); return NULL; }
+        if (fseek(in, 0, SEEK_SET) != 0) { fclose(in); return NULL; }
+    }
     buf = malloc(cap);
     if (!buf) { fclose(in); return NULL; }
     for (;;) {
@@ -349,7 +428,10 @@ static int backup_and_disable_mmu(fel_device *dev, uint32_t tt[4096],
                                   uint32_t *sctlr_out)
 {
     uint32_t sctlr, dacr, ttbcr, ttbr0, i;
-    unsigned char raw[16384];
+    /* v3.1: off the stack (static storage; single-threaded tool).
+     * v3 had this 16 KiB buffer on the stack, nested under main's
+     * own 16 KiB tt[4096] — the largest latent stack risk. */
+    static unsigned char raw[16384];
     /* fel.c L975-980: ignore M/Z/I/V/UNK bits, expect no TEX remap. */
     if (get_sctlr(dev, &sctlr) != 0)
         return -1;
@@ -400,7 +482,9 @@ static int backup_and_disable_mmu(fel_device *dev, uint32_t tt[4096],
 static int restore_and_enable_mmu(fel_device *dev, uint32_t tt[4096])
 {
     uint32_t ttbr0, i;
-    unsigned char raw[16384], code[48];
+    /* v3.1: off the stack, same reason as backup_and_disable_mmu. */
+    static unsigned char raw[16384];
+    unsigned char code[48];
     if (get_ttbr0(dev, &ttbr0) != 0)
         return -1;
     if (ttbr0 == 0)
@@ -456,31 +540,47 @@ int main(int argc, char **argv)
 {
     const char *tool = "fel_spl_uboot";
     char *params[1];
+    const char *flags[4];
     static const char *env_names[1] = { "FEL_FILE" };
-    int fd = -1;
+    int fd = -1, i;
     unsigned char *file = NULL;
     size_t file_len = 0;
     char file_sha[65] = "";
     char spl_sha[65] = "";
     uint32_t spl_len = 0, spl_len_limit = H3_SPL_LEN_LIMIT;
     uint32_t uboot_load = 0, uboot_ep = 0, uboot_size = 0;
+    uint16_t soc_id_checked = 0;
     fel_device dev;
     int dev_open = 0;
     char err[256];
     int rc = 1;
 
+    /* v3.1: unbuffered stdout — every progress line reaches the
+     * pipe the moment it is printed, even if the process is
+     * killed afterwards. Without this, a kill loses everything
+     * buffered since the last fflush. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     memset(&dev, 0, sizeof(dev));
 
-    if (fel_resolve_fd_and_params(argc, argv, 1, params, NULL, 0,
+    if (fel_resolve_fd_and_params(argc, argv, 1, params, flags, 4,
                                   env_names, &fd) != 0) {
         fel_print_error(tool,
-            "usage: fel_spl_uboot <fd> <u-boot-sunxi-with-spl.bin>");
+            "usage: fel_spl_uboot [--validate-only] <fd> <u-boot-sunxi-with-spl.bin>");
         return 2;
+    }
+    for (i = 0; flags[i]; i++) {
+        if (strcmp(flags[i], "--validate-only") == 0)
+            g_validate_only = 1;
+    }
+    {
+        const char *env_vo = getenv("FEL_VALIDATE_ONLY");
+        if (env_vo && strcmp(env_vo, "1") == 0)
+            g_validate_only = 1;
     }
 
     /* ---- validate the file BEFORE touching the device ---- */
     file = read_all_file(params[0], &file_len);
-    CHECK(file != NULL, "cannot open input file");
+    CHECK(file != NULL, "cannot open input file (or file is over 2 MiB)");
     CHECK(file_len <= UB_MAX_FILE, "file too large (refusing files over 2 MiB)");
     fel_sha256_hex(file, file_len, file_sha);
     {
@@ -537,8 +637,22 @@ int main(int argc, char **argv)
         }
     }
 
+    /* v3.1 banner: printed AFTER validation and BEFORE any device
+     * access. If the phone run shows this line and nothing after
+     * it, the tool died opening the device or in the FEL_VERSION
+     * exchange — not in file validation. */
+    printf("{\"banner\":true,\"tool\":\"%s\",\"file_size\":%u,"
+           "\"file_sha256\":\"%s\",\"spl_len\":%u,\"spl_sha256\":\"%s\","
+           "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\","
+           "\"uboot_size\":%u,\"validate_only\":%s}\n",
+           tool, (unsigned)file_len, file_sha,
+           spl_len, spl_sha, uboot_load, uboot_ep, uboot_size,
+           g_validate_only ? "true" : "false");
+    fflush(stdout);
+
     /* ---- open the device, prove FEL is alive, H3 only ---- */
     if (fel_open(fd, &dev, err, sizeof(err)) != 0) {
+        diag("fel_open", err);
         snprintf(g_error, sizeof(g_error), "%s", err);
         g_failed = 1;
         goto out;
@@ -550,12 +664,15 @@ int main(int argc, char **argv)
         if (fel_send_request(&dev, AW_FEL_VERSION, 0, 0) != 0 ||
             fel_read_version_reply(&dev, ver) != 0 ||
             memcmp(ver, "AWUSBFEX", 8) != 0) {
+            diag("fel_version_soc_check",
+                 "FEL_VERSION failed: device is not answering in FEL mode");
             snprintf(g_error, sizeof(g_error),
                      "%s", "FEL_VERSION failed: device is not answering in FEL mode");
             g_failed = 1;
             goto out;
         }
         soc_id = (uint16_t)((fel_get_le32(ver + 8) >> 8) & 0xffff);
+        soc_id_checked = soc_id;
         {
             char d[128];
             snprintf(d, sizeof(d), "soc_id 0x%04x (%s), scratchpad 0x%04x",
@@ -567,6 +684,17 @@ int main(int argc, char **argv)
               "only Allwinner H3 (soc_id 0x1680) is supported by this tool");
     }
 
+    /* v3.1 validate-only: stop here — validation + FEL_VERSION /
+     * soc check passed, no write or exec has happened. This
+     * isolates "tool/transport broken" from "device fails during
+     * the SPL/U-Boot flow". */
+    if (g_validate_only) {
+        STEP("validate_only", 1,
+             "validation + FEL_VERSION/soc check passed; no write/exec performed (validate-only mode)");
+        rc = 0;
+        goto out;
+    }
+
     /* ---- stackinfo (logging only, fel.c L1129) ---- */
     {
         uint32_t sp_irq = 0, sp = 0;
@@ -575,17 +703,25 @@ int main(int argc, char **argv)
             snprintf(d, sizeof(d), "sp_irq=0x%08x, sp=0x%08x", sp_irq, sp);
             STEP("get_stackinfo", 1, d);
         } else {
+            fprintf(stderr, "fel_spl_uboot: warning: step=get_stackinfo failed: scratch code did not return stack pointers (logging only, continuing)\n");
+            fflush(stderr);
             STEP("get_stackinfo", 0, "scratch code did not return stack pointers (logging only, continuing)");
         }
     }
 
     /* ---- MMU: backup (H3: MMU off, expect NULL) + setup ---- */
     {
-        uint32_t tt[4096];
+        /* v3.1: off the stack (static storage; single-threaded
+         * tool). v3 had this 16 KiB table on the stack, nested
+         * under the 16 KiB raw buffers of the MMU helpers. */
+        static uint32_t tt[4096];
         uint32_t sctlr = 0;
         int mmu = backup_and_disable_mmu(&dev, tt, &sctlr);
         char d[160];
         if (mmu < 0) {
+            diag("mmu_backup_and_disable",
+                 mmu == -2 ? "Unexpected SCTLR (fel.c L975-980)"
+                           : "MMU backup failed (fel.c L933-1016)");
             snprintf(g_error, sizeof(g_error),
                      "%s", mmu == -2 ? "Unexpected SCTLR (fel.c L975-980)"
                                     : "MMU backup failed (fel.c L933-1016)");
@@ -602,9 +738,21 @@ int main(int argc, char **argv)
              * (fel.c L1018-1076); this tool does the same. */
             CHECK((H3_MMU_TT_ADDR & 0x3FFFu) == 0,
                   "SPL: 'mmu_tt_addr' must be 16K aligned");
-            CHECK(set_dacr(&dev, 0x55555555u) == 0, "set DACR failed");
-            CHECK(set_ttbcr(&dev, 0x00000000u) == 0, "set TTBCR failed");
-            CHECK(set_ttbr0(&dev, H3_MMU_TT_ADDR) == 0, "set TTBR0 failed");
+            if (set_dacr(&dev, 0x55555555u) != 0) {
+                diag("mmu_generate_table", "set DACR failed");
+                snprintf(g_error, sizeof(g_error), "%s", "set DACR failed");
+                g_failed = 1; goto out;
+            }
+            if (set_ttbcr(&dev, 0x00000000u) != 0) {
+                diag("mmu_generate_table", "set TTBCR failed");
+                snprintf(g_error, sizeof(g_error), "%s", "set TTBCR failed");
+                g_failed = 1; goto out;
+            }
+            if (set_ttbr0(&dev, H3_MMU_TT_ADDR) != 0) {
+                diag("mmu_generate_table", "set TTBR0 failed");
+                snprintf(g_error, sizeof(g_error), "%s", "set TTBR0 failed");
+                g_failed = 1; goto out;
+            }
             generate_mmu_tt(tt);
             STEP("mmu_generate_table", 1,
                  "new translation table generated for 0x8000 (DACR 0x55555555, TTBCR 0, TTBR0 0x8000); table is written back in the restore step, as upstream does");
@@ -633,6 +781,7 @@ int main(int argc, char **argv)
                     char d[160];
                     if (tmp > remaining) tmp = (uint32_t)remaining;
                     if (fel_write_mem(&dev, cur_addr, file + file_off, tmp) != 0) {
+                        diag("spl_write_piece", "FEL_WRITE to SRAM failed (device stopped answering?)");
                         snprintf(g_error, sizeof(g_error), "%s", "SPL piece write failed");
                         g_failed = 1;
                         goto out;
@@ -647,6 +796,7 @@ int main(int argc, char **argv)
                     char d[160];
                     if (tmp > remaining) tmp = (uint32_t)remaining;
                     if (fel_write_mem(&dev, H3_SWAP[i].buf2, file + file_off, tmp) != 0) {
+                        diag("spl_write_piece_backup", "FEL_WRITE to backup SRAM failed (device stopped answering?)");
                         snprintf(g_error, sizeof(g_error), "%s", "SPL backup write failed");
                         g_failed = 1;
                         goto out;
@@ -665,6 +815,7 @@ int main(int argc, char **argv)
             if (remaining > 0) {
                 char d[160];
                 if (fel_write_mem(&dev, cur_addr, file + file_off, remaining) != 0) {
+                    diag("spl_write_remaining", "FEL_WRITE to SRAM failed (device stopped answering?)");
                     snprintf(g_error, sizeof(g_error), "%s", "SPL remaining write failed");
                     g_failed = 1;
                     goto out;
@@ -697,6 +848,7 @@ int main(int argc, char **argv)
             if (fel_write_mem(&dev, H3_THUNK_ADDR, tbuf, thunk_size) != 0 ||
                 fel_exec_mem(&dev, H3_THUNK_ADDR) != 0) {
                 free(tbuf);
+                diag("thunk_exec", "thunk FEL_WRITE/FEL_EXEC failed (device stopped answering during thunk exec?)");
                 snprintf(g_error, sizeof(g_error), "%s", "thunk write/exec failed");
                 g_failed = 1;
                 goto out;
@@ -715,6 +867,7 @@ int main(int argc, char **argv)
             unsigned char sig[8];
             char d[128];
             if (fel_read_mem(&dev, H3_SPL_ADDR + 4, sig, sizeof(sig)) != 0) {
+                diag("egon_fel_readback", "FEL_READ of SPL header failed (FEL stopped answering after the thunk)");
                 snprintf(g_error, sizeof(g_error), "%s",
                          "SPL: could not read back the SPL header (FEL stopped answering after the thunk)");
                 g_failed = 1;
@@ -731,6 +884,9 @@ int main(int argc, char **argv)
         {
             int r = restore_and_enable_mmu(&dev, tt);
             if (r != 0) {
+                diag("mmu_restore_and_enable",
+                     r == -2 ? "MMU restore refused: TTBR0 is 0"
+                             : "MMU restore failed (fel.c L1018-1076)");
                 snprintf(g_error, sizeof(g_error), "%s",
                          r == -2 ? "MMU restore refused: TTBR0 is 0"
                                  : "MMU restore failed (fel.c L1018-1076)");
@@ -757,6 +913,7 @@ int main(int argc, char **argv)
             uint32_t n = uboot_size - off;
             if (n > UB_CHUNK) n = UB_CHUNK;
             if (fel_write_mem(&dev, uboot_load + off, payload + off, n) != 0) {
+                diag("uboot_stage", "DRAM FEL_WRITE failed (DRAM may not be initialised: SPL may have failed to init DRAM)");
                 snprintf(g_error, sizeof(g_error), "%s",
                          "U-Boot staging write failed (DRAM may not be initialised: SPL may have failed to init DRAM)");
                 g_failed = 1;
@@ -783,6 +940,7 @@ int main(int argc, char **argv)
     {
         char d[192];
         if (fel_send_request(&dev, AW_FEL_1_EXEC, uboot_load, 0) != 0) {
+            diag("uboot_exec", "U-Boot exec request was not accepted by FEL");
             snprintf(g_error, sizeof(g_error), "%s", "U-Boot exec request was not accepted by FEL");
             g_failed = 1;
             goto out;
@@ -809,6 +967,30 @@ out:
         free(file);
         if (dev_open) fel_close(&dev);
         return r;
+    }
+    if (g_validate_only) {
+        /* Validate-only success: no SPL/U-Boot flow ran, so there
+         * is no eGON.FEL and no U-Boot exec to report. */
+        printf("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
+               "\"validate_only\":true,"
+               "\"file_sha256\":\"%s\",\"file_size\":%u,"
+               "\"spl_len\":%u,\"spl_sha256\":\"%s\","
+               "\"uboot_load\":\"0x%08x\",\"uboot_entry\":\"0x%08x\",\"uboot_size\":%u,"
+               "\"soc_id\":\"0x%04x\","
+               "\"bulk_ep_out\":%d,\"bulk_ep_in\":%d,"
+               "\"vid\":\"0x%04x\",\"pid\":\"0x%04x\",\"verified_on_device\":true,"
+               "\"steps\":[%s],"
+               "\"note\":\"Validate-only: file validation + FEL_VERSION/soc check passed; no write or exec was performed.\"}\n",
+               tool, file_sha, (unsigned)file_len,
+               spl_len, spl_sha,
+               uboot_load, uboot_ep, uboot_size,
+               soc_id_checked,
+               dev.bulk_ep_out, dev.bulk_ep_in, dev.vid, dev.pid,
+               g_steps);
+        fflush(stdout);
+        free(file);
+        if (dev_open) fel_close(&dev);
+        return rc;
     }
     printf("{\"ok\":true,\"tool\":\"%s\",\"version\":1,"
            "\"file_sha256\":\"%s\",\"file_size\":%u,"

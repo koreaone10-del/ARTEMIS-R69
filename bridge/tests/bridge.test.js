@@ -25,7 +25,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
-const { createServer, buildTermuxUsbCmd, validateFullUbootImage } = require('../server');
+const { createServer, buildTermuxUsbCmd, validateFullUbootImage, parseSplUbootOutput } = require('../server');
 
 function startTestServer() {
   return new Promise((resolve, reject) => {
@@ -353,6 +353,9 @@ test('validateFullUbootImage accepts the real-shaped full image', () => {
   // The same bytes must also pass the C tool's validation: run the
   // compiled binary (if present) with a bad fd and check that all
   // four validation steps pass before fel_open fails.
+  // v3.1: stdout is now multi-line (one progress line per step, a
+  // banner line, then the final JSON as the LAST line), so parse
+  // the last line as the result and check the progress lines too.
   const fs = require('node:fs');
   const bin = path.join(__dirname, '..', 'fel_spl_uboot');
   if (fs.existsSync(bin)) {
@@ -361,7 +364,12 @@ test('validateFullUbootImage accepts the real-shaped full image', () => {
     fs.writeFileSync(tmp, data);
     try {
       const r = spawnSync(bin, ['3', tmp], { encoding: 'utf8', timeout: 10000 });
-      const out = JSON.parse(r.stdout);
+      const lines = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+      const progress = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      assert.equal(progress.filter((o) => o.progress === true).length, 4);
+      assert.equal(progress.filter((o) => o.banner === true).length, 1);
+      assert.equal(progress.find((o) => o.banner === true).validate_only, false);
+      const out = JSON.parse(lines[lines.length - 1]);
       assert.equal(out.ok, false); // no USB device on fd 3
       assert.deepEqual(out.steps.map((s) => s.name), [
         'validate_file_size', 'validate_egon_header',
@@ -497,4 +505,128 @@ test('fel-spl-uboot command string is unquoted and rejects unsafe tokens', () =>
   );
   assert.ok(!buildTermuxUsbCmd('/x/bridge/fel_spl_uboot', ['/x/bridge/run/f.bin']).includes("'"));
   assert.throws(() => buildTermuxUsbCmd('/x/bridge/fel_spl_uboot', ['/x/bridge/run/f b.bin']), /unsafe termux-usb command token/);
+});
+
+/* --- v3.1: incremental progress, banner, validate-only --- */
+
+function runCTool(args, env = {}) {
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const bin = path.join(__dirname, '..', 'fel_spl_uboot');
+  if (!fs.existsSync(bin)) return null;
+  const r = spawnSync(bin, args, { encoding: 'utf8', timeout: 10000, env: { ...process.env, ...env } });
+  const lines = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  const parsed = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  return { r, lines, parsed,
+    progress: parsed.filter((o) => o.progress === true),
+    banner: parsed.find((o) => o.banner === true) || null,
+    final: parsed.length ? parsed[parsed.length - 1] : null };
+}
+
+test('v3.1: fel_spl_uboot --validate-only prints progress lines + banner and stops at fel_open (no write)', () => {
+  const fs = require('node:fs');
+  const data = makeValidUbootImage();
+  const tmp = path.join(__dirname, 'tmp-v31-validate.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const out = runCTool(['--validate-only', '3', tmp]);
+    if (!out) return; // binary not built in this checkout; server tests cover validation
+    assert.equal(out.progress.length, 4, 'four validation steps as progress lines');
+    assert.deepEqual(out.progress.map((p) => p.name), [
+      'validate_file_size', 'validate_egon_header',
+      'validate_egon_checksum', 'validate_uboot_header',
+    ]);
+    assert.ok(out.banner, 'banner line present');
+    assert.equal(out.banner.validate_only, true);
+    assert.equal(out.banner.spl_len, 24576);
+    assert.equal(out.banner.uboot_load, '0x4a000000');
+    assert.equal(out.final.ok, false); // no USB device on fd 3
+    assert.equal(out.final.validate_only, true);
+    assert.equal(out.final.error, 'libusb_wrap_sys_device failed');
+    assert.ok(out.r.stderr.includes('step=fel_open failed'), 'stderr diagnostic for fel_open');
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('v3.1: fel_spl_uboot validate-only via FEL_VALIDATE_ONLY=1 behaves the same', () => {
+  const fs = require('node:fs');
+  const data = makeValidUbootImage();
+  const tmp = path.join(__dirname, 'tmp-v31-validate-env.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const out = runCTool(['3', tmp], { FEL_VALIDATE_ONLY: '1' });
+    if (!out) return;
+    assert.equal(out.banner && out.banner.validate_only, true);
+    assert.equal(out.final.validate_only, true);
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('v3.1: corrupted eGON checksum is refused with progress lines, and no banner', () => {
+  const fs = require('node:fs');
+  const data = makeValidUbootImage();
+  data[1000] ^= 0xff; // break the eGON checksum
+  const tmp = path.join(__dirname, 'tmp-v31-bad-checksum.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const out = runCTool(['3', tmp]);
+    if (!out) return;
+    // Only the first two validation steps ran; the banner is
+    // printed only after ALL validation passes, so it must be absent.
+    assert.deepEqual(out.progress.map((p) => p.name), ['validate_file_size', 'validate_egon_header']);
+    assert.equal(out.banner, null);
+    assert.equal(out.final.ok, false);
+    assert.match(out.final.error, /checksum check failed/);
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('v3.1: parseSplUbootOutput extracts progress lines, banner, and the last line as the final result', () => {
+  const run = { stdout: [
+    '{"progress":true,"step":0,"name":"validate_file_size","ok":true,"detail":"size 559480 bytes, sha256 x"}',
+    '{"banner":true,"tool":"fel_spl_uboot","file_size":559480,"validate_only":false}',
+    '{"progress":true,"step":3,"name":"validate_uboot_header","ok":true,"detail":"mkimage header ok"}',
+    '{"ok":false,"tool":"fel_spl_uboot","version":1,"steps":[],"error":"libusb_wrap_sys_device failed"}',
+    '',
+  ].join('\n') };
+  const { final, progress, banner } = parseSplUbootOutput(run);
+  assert.equal(progress.length, 2);
+  assert.equal(banner.file_size, 559480);
+  assert.equal(final.ok, false);
+  assert.equal(final.error, 'libusb_wrap_sys_device failed');
+  // The v3 silent-failure case: no final line at all, but the
+  // progress lines survive and must be returned.
+  const silent = parseSplUbootOutput({ stdout: '{"progress":true,"step":0,"name":"validate_file_size","ok":true,"detail":"size 559480 bytes"}\n{"banner":true,"tool":"fel_spl_uboot","file_size":559480}\n' });
+  assert.equal(silent.final, null);
+  assert.equal(silent.progress.length, 1);
+  assert.equal(silent.banner.file_size, 559480);
+});
+
+test('v3.1: fel-spl-uboot validate_only:true is accepted and records no session write', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const { status, body } = await post(base, '/api/bridge/fel-spl-uboot', splUbootBody({ validate_only: true }));
+    // In this VM termux-usb is absent (503) or the binary is not
+    // built (501) or the tool fails at the device (502) — none of
+    // those is a validation refusal, and none must record a write.
+    assert.ok([501, 502, 503].includes(status), `unexpected status ${status}: ${JSON.stringify(body)}`);
+    assert.notEqual(body.error, 'bad_egon');
+    assert.notEqual(body.error, 'bad_checksum');
+    assert.notEqual(body.error, 'bad_uboot_header');
+    const session = await fetch(`${base}/api/bridge/session`).then((r) => r.json());
+    assert.deepEqual(session.written, [], 'validate-only must not record a written range');
+  } finally { await stop(server); }
+});
+
+test('v3.1: fel-spl-uboot validate-only with a bad file is still refused before any device access', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const bad = makeValidUbootImage();
+    bad.write('XXXX.BT0', 4, 'latin1');
+    const { status, body } = await post(base, '/api/bridge/fel-spl-uboot', {
+      device: DEV,
+      base64: Buffer.from(bad).toString('base64'),
+      sha256: crypto.createHash('sha256').update(bad).digest('hex'),
+      confirm: true, validate_only: true,
+    });
+    assert.equal(status, 400);
+    assert.equal(body.error, 'bad_egon');
+  } finally { await stop(server); }
 });

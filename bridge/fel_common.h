@@ -148,7 +148,9 @@ int fel_exec_mem(fel_device *dev, uint32_t addr);
  * line, accepting the three ways termux-usb can hand a device over:
  *   1. $TERMUX_USB_FD is set (-E form): params are argv[1..] in order.
  *   2. fd is argv[1] (v1 form, proven live on the phone for
- *      fel_version): params are argv[2..] in order.
+ *      fel_version): params are argv[2..] in order. Leading
+ *      "--" flags may precede the fd (v3.1: fel_spl_uboot
+ *      --validate-only <fd> <file>).
  *   3. fd is the LAST argv token (termux-usb -e "cmd args" form,
  *      where the fd is appended after the command string):
  *      params are argv[1..n-1] in order.

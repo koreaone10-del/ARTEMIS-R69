@@ -1,7 +1,10 @@
 'use strict';
 /*
- * ARTEMIS Termux bridge server -- v3, SRAM-only FEL read/write/exec
+ * ARTEMIS Termux bridge server -- v3.1, SRAM-only FEL read/write/exec
  * plus upstream-style SPL + U-Boot staging (fel_spl_uboot).
+ * v3.1: fel_spl_uboot prints incremental progress lines (v3 printed
+ * nothing on the phone on 2026-11-17) and fel-spl-uboot accepts
+ * validate_only:true — run that first, before the full flow.
  *
  * Binds 127.0.0.1:3001 only. There is NO eMMC / flash / NAND write
  * endpoint, and there never will be one on this server: FEL_WRITE
@@ -39,7 +42,7 @@
  *   POST /api/bridge/fel-read     {device, address, length}
  *   POST /api/bridge/fel-write    {device, address, base64, sha256, confirm:true, spl?:boolean}
  *   POST /api/bridge/fel-exec     {device, address, confirm:true}
- *   POST /api/bridge/fel-spl-uboot {device, base64, sha256, confirm:true}
+ *   POST /api/bridge/fel-spl-uboot {device, base64, sha256, confirm:true, validate_only?:boolean}
  *   GET  /api/bridge/session      written ranges in this session
  *   GET  /api/bridge/report
  *
@@ -104,7 +107,7 @@ const FEL_READ_BIN = path.join(BRIDGE_DIR, 'fel_read');
 const FEL_WRITE_BIN = path.join(BRIDGE_DIR, 'fel_write');
 const FEL_EXEC_BIN = path.join(BRIDGE_DIR, 'fel_exec');
 const FEL_SPL_UBOOT_BIN = path.join(BRIDGE_DIR, 'fel_spl_uboot');
-const VERSION = '3.0.0';
+const VERSION = '3.1.0';
 
 const HOST = '127.0.0.1';
 if (process.env.BRIDGE_HOST && process.env.BRIDGE_HOST !== HOST) {
@@ -471,6 +474,32 @@ function parseToolJson(run) {
   try { return JSON.parse(run.stdout.trim()); } catch { return null; }
 }
 
+/* v3.1: fel_spl_uboot prints one progress JSON line per step, a
+ * banner line, and the final result JSON as the LAST line. The
+ * old parseToolJson (JSON.parse of the whole stdout) would fail
+ * on that multi-line output, so this parser splits by lines:
+ * progress lines have "progress":true, the banner has
+ * "banner":true, and the final result is the last line that is a
+ * JSON object with an "ok" field and neither flag. Returns
+ * { final, progress, banner } with final null when no result line
+ * was printed (the v3 silent-failure case — the progress lines
+ * are then the only diagnosis, and they are returned too). */
+function parseSplUbootOutput(run) {
+  const progress = [];
+  let banner = null;
+  let final = null;
+  for (const line of String(run.stdout || '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t.startsWith('{')) continue;
+    let obj;
+    try { obj = JSON.parse(t); } catch { continue; }
+    if (obj && obj.progress === true) { progress.push(obj); continue; }
+    if (obj && obj.banner === true) { banner = obj; continue; }
+    if (obj && typeof obj.ok === 'boolean') final = obj;
+  }
+  return { final, progress, banner };
+}
+
 function parseProbeOutput(stdout) {
   const vidPid = stdout.match(/VID:PID\s+([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})/);
   const get = (label) => {
@@ -513,7 +542,7 @@ function statusBody() {
     sunxiFelAvailable: commandExists('sunxi-fel'),
     writtenRanges: writtenRanges.length,
     latestReport: latestReport() ? { exists: true, generatedAt: latestReport().generatedAt || null } : { exists: false },
-    note: 'v3: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead.',
+    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.1: fel_spl_uboot prints one progress JSON line per step immediately (the v3 tool printed nothing on the phone on 2026-11-17), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first.',
   };
 }
 
@@ -720,10 +749,15 @@ async function handler(req, res) {
     return send(res, 200, report, req);
   }
   if (req.method === 'POST' && url.pathname === '/api/bridge/fel-spl-uboot') {
-    // v3: one flow — validate the full u-boot-sunxi-with-spl.bin
+    // v3.1: one flow — validate the full u-boot-sunxi-with-spl.bin
     // server-side, then run fel_spl_uboot (upstream SPL swap/thunk
     // + eGON.FEL check + U-Boot staging in DRAM + exec). The C tool
     // re-validates the file before touching the device.
+    // validate_only:true runs the C tool with --validate-only:
+    // file validation + FEL_VERSION/soc check only, no write or
+    // exec, 10 s timeout. Run it FIRST on the phone: v3 printed
+    // nothing at all on 2026-11-17, and validate-only isolates
+    // "tool/transport broken" from "device fails during the flow".
     let body = {};
     try { body = await readJson(req, 1024 * 1024); } catch (e) { return send(res, e.status || 400, { ok: false, error: 'invalid_json' }, req); }
     const resolved = await resolveDevice(body.device);
@@ -732,6 +766,7 @@ async function handler(req, res) {
       return send(res, 400, { ok: false, error: 'confirm_required',
         message: 'fel-spl-uboot requires confirm:true in the request body' }, req);
     }
+    const validateOnly = body.validate_only === true;
     if (typeof body.base64 !== 'string' || !body.base64) {
       return send(res, 400, { ok: false, error: 'invalid_data',
         message: 'base64 data is required' }, req);
@@ -759,26 +794,43 @@ async function handler(req, res) {
     let run;
     try {
       fs.writeFileSync(tmpFile, bytes);
-      // 60 s timeout: the flow does an SPL write, a thunk exec,
-      // a 250 ms wait, an eGON.FEL read-back and a ~527 KiB DRAM
-      // staging in 64 KiB chunks. The C tool reports every step.
-      run = await runViaTermuxUsbCmd(FEL_SPL_UBOOT_BIN, [tmpFile],
-        resolved.device, 60000, { FEL_FILE: tmpFile });
+      // 60 s timeout for the full flow: SPL write, thunk exec,
+      // 250 ms wait, eGON.FEL read-back and ~527 KiB DRAM staging
+      // in 64 KiB chunks. 10 s for validate-only (validation +
+      // FEL_VERSION only). The C tool reports every step as an
+      // incremental progress line; parseSplUbootOutput extracts
+      // those lines plus the final result line.
+      run = await runViaTermuxUsbCmd(FEL_SPL_UBOOT_BIN,
+        [tmpFile, ...(validateOnly ? ['--validate-only'] : [])],
+        resolved.device, validateOnly ? 10000 : 60000,
+        { FEL_FILE: tmpFile, ...(validateOnly ? { FEL_VALIDATE_ONLY: '1' } : {}) });
     } finally {
       try { fs.unlinkSync(tmpFile); } catch { /* best effort cleanup */ }
     }
     if (!run.ok) return send(res, run.status, { ok: false, error: run.error, message: run.message }, req);
-    const parsed = parseToolJson(run);
+    const splOut = parseSplUbootOutput(run);
+    const parsed = splOut.final;
     if (!parsed) {
       return send(res, 502, { ok: false, error: 'fel_spl_uboot_bad_output',
         message: 'fel_spl_uboot did not return JSON; the termux-usb command-string form may not work on this phone, see bridge/README.md for the direct Termux fallback',
-        stdout: run.stdout.slice(0, 2000), stderr: run.stderr.slice(0, 2000) }, req);
+        stdout: run.stdout.slice(0, 2000), stderr: run.stderr.slice(0, 2000),
+        progress: splOut.progress, banner: splOut.banner }, req);
     }
     if (run.code !== 0 || !parsed.ok) {
       // The step log is the diagnosis: return it in full, including
       // the eGON.FEL read-back result, so the user can report it.
+      // v3.1: also return the incremental progress lines, which
+      // survive even when the final JSON is missing a step.
       return send(res, 502, { ok: false, error: 'fel_spl_uboot_failed', detail: parsed,
-        message: 'fel-spl-uboot stopped before or during the SPL/U-Boot flow; check the step log in detail.steps, then re-check FEL_VERSION (a reply means FEL is still alive)' }, req);
+        message: 'fel-spl-uboot stopped before or during the SPL/U-Boot flow; check the step log in detail.steps, then re-check FEL_VERSION (a reply means FEL is still alive)',
+        progress: splOut.progress, banner: splOut.banner }, req);
+    }
+    if (validateOnly) {
+      // No write happened, so nothing is recorded in the session.
+      const report = { ...parsed, generatedAt: new Date().toISOString(), device: resolved.device,
+        validated, progress: splOut.progress, banner: splOut.banner };
+      try { saveReport(report); } catch { /* see probe */ }
+      return send(res, 200, report, req);
     }
     // Record the SPL range as written in this session, so a later
     // fel-exec at 0x00000000 is allowed by the session gate.
@@ -789,7 +841,7 @@ async function handler(req, res) {
     };
     recordWrite(entry);
     const report = { ...parsed, generatedAt: new Date().toISOString(), device: resolved.device,
-      session: entry, validated };
+      session: entry, validated, progress: splOut.progress, banner: splOut.banner };
     try { saveReport(report); } catch { /* see probe */ }
     return send(res, 200, report, req);
   }
@@ -862,4 +914,5 @@ if (require.main === module) {
 module.exports = { server, handler, createServer, HOST, PORT, VERSION,
   parseAddress, parseLength, readAllowed, writeAllowed, execAllowed,
   inSram, inSid, hexAddr, writtenRanges, buildTermuxUsbCmd,
+  parseSplUbootOutput,
   validateFullUbootImage, UB_MAX_FILE, SPL_LEN_LIMIT };

@@ -323,9 +323,30 @@ function ubValidateHeaders(buf) {
   return { ok: true, splLen, load, entry, size };
 }
 function updateUbWriteExecButton() {
+  const ok = Boolean(ubFileBytes && $('ubAcknowledge')?.checked);
   const btn = $('ubWriteExec');
-  if (!btn) return;
-  btn.disabled = !(ubFileBytes && $('ubAcknowledge')?.checked);
+  if (btn) btn.disabled = !ok;
+  const vbtn = $('ubValidateOnly');
+  if (vbtn) vbtn.disabled = !ok;
+}
+// v3.1: render the C tool's incremental progress lines (and the
+// banner) as they arrive in the server response — in v3 the tool
+// printed nothing at all on the phone, so any progress line that
+// does appear is the diagnosis.
+function ubProgressText(j) {
+  const lines = [];
+  if (j.banner) lines.push(`ملف: ${j.banner.file_size} بايت، SHA ${String(j.banner.file_sha256 || '').slice(0, 16)}…، SPL ${j.banner.spl_len} بايت، U-Boot ${j.banner.uboot_load} / ${j.banner.uboot_entry}`);
+  const prog = j.progress || j.detail?.progress || [];
+  for (const s of prog) lines.push(`${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`);
+  return lines.join('\n');
+}
+function ubShowProgress(j) {
+  const box = $('ubProgress');
+  if (!box) return;
+  const t = ubProgressText(j);
+  if (!t) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  box.textContent = `التقدم (خطوة بخطوة، يصل فور حدوثه):\n${t}`;
 }
 $('ubFile')?.addEventListener('change', async e => {
   const f = e.target.files?.[0] || null;
@@ -347,6 +368,28 @@ $('ubFile')?.addEventListener('change', async e => {
   } catch (err) { if (meta) meta.textContent = `تعذّرت قراءة الملف: ${err.message}`; }
 });
 $('ubAcknowledge')?.addEventListener('change', updateUbWriteExecButton);
+$('ubValidateOnly')?.addEventListener('click', async () => {
+  const out = $('ubResult');
+  if (!out) return;
+  if (!ubFileBytes) { out.textContent = 'اختر الملف الكامل أولاً.'; return; }
+  out.textContent = 'جارٍ التحقق فقط… يتحقق من الملف ومن FEL_VERSION، دون أي كتابة أو تنفيذ (مهلة 10 ثوانٍ).';
+  try {
+    const device = bridgeDeviceOrThrow();
+    const base64 = base64EncodeBytes(ubFileBytes);
+    const r = await fetch(BRIDGE_BASE + '/api/bridge/fel-spl-uboot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, base64, sha256: ubFileSha256, confirm: true, validate_only: true }) });
+    const j = await r.json().catch(() => ({ ok: false, error: 'bad_json' }));
+    ubShowProgress(j);
+    if (!r.ok) {
+      const steps = j.detail?.steps || [];
+      const stepText = steps.map(s => `${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`).join('\n');
+      out.textContent = `فشل التحقق فقط (${j.error || `HTTP ${r.status}`}): ${j.message || ''}\n\nالتقدم:\n${ubProgressText(j) || '(لا توجد خطوات — الأداة لم تطبع شيئاً، أرسل هذا التقرير كاملاً إلى Muse)'}\n\nخطوات التنفيذ:\n${stepText || '(لا توجد خطوات)'}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً.`;
+      log('bridge-spl-uboot-validate-error', `fel-spl-uboot validate-only failed: ${j.error || r.status}`);
+      return;
+    }
+    out.textContent = `✓ نجح التحقق فقط.\nالملف صالح (eGON + checksum + ترويسة mkimage)، وFEL_VERSION ردّ بـ H3 (0x1680). لم تُكتب أي بايتات ولم يُنفَّذ أي كود.\n\nالتقدم:\n${ubProgressText(j)}\n\nالآن يمكنك الضغط على «كتابة SPL + تنفيذ U-Boot (v3)» للتدفق الكامل.`;
+    log('bridge-spl-uboot-validate', 'fel-spl-uboot validate-only passed.');
+  } catch (e) { out.textContent = `فشل التحقق فقط: ${e.message}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ رسالة الخطأ كاملة وأرسلها إلى Muse.`; log('bridge-spl-uboot-validate-error', e.message); }
+});
 $('ubWriteExec')?.addEventListener('click', async () => {
   const out = $('ubResult');
   if (!out) return;
@@ -361,16 +404,17 @@ $('ubWriteExec')?.addEventListener('click', async () => {
     // diagnosis — it must reach the screen, not be discarded.
     const r = await fetch(BRIDGE_BASE + '/api/bridge/fel-spl-uboot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device, base64, sha256: ubFileSha256, confirm: true }) });
     const j = await r.json().catch(() => ({ ok: false, error: 'bad_json' }));
+    ubShowProgress(j);
     if (!r.ok) {
       const steps = j.detail?.steps || [];
       const stepText = steps.map(s => `${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`).join('\n');
-      out.textContent = `فشل SPL + U-Boot (${j.error || `HTTP ${r.status}`}): ${j.message || ''}\n\nخطوات التنفيذ:\n${stepText || '(لا توجد خطوات)'}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ هذا التقرير كاملاً وأرسله إلى Muse.`;
+      out.textContent = `فشل SPL + U-Boot (${j.error || `HTTP ${r.status}`}): ${j.message || ''}\n\nالتقدم (وصل قبل الفشل):\n${ubProgressText(j) || '(لا توجد خطوات — الأداة لم تطبع شيئاً، أرسل هذا التقرير كاملاً إلى Muse)'}\n\nخطوات التنفيذ:\n${stepText || '(لا توجد خطوات)'}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ هذا التقرير كاملاً وأرسله إلى Muse.`;
       log('bridge-spl-uboot-error', `fel-spl-uboot failed: ${j.error || r.status}`);
       return;
     }
     bridgeSetReport(j);
     const steps = Array.isArray(j.steps) ? j.steps.map(s => `${s.ok ? '✓' : '✗'} ${s.name}: ${s.detail}`).join('\n') : '';
-    out.textContent = `اكتمل SPL + U-Boot.\nSHA-256: ${ubFileSha256}\nU-Boot load/entry: ${j.uboot_load} / ${j.uboot_entry}\neGON.FEL: ${j.egon_fel ? 'نعم' : 'لا'} — U-Boot exec sent: ${j.uboot_exec_sent ? 'نعم' : 'لا'}\n\nخطوات التنفيذ:\n${steps}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nالآن اتبع قائمة ما بعد التشغيل أدناه.`;
+    out.textContent = `اكتمل SPL + U-Boot.\nSHA-256: ${ubFileSha256}\nU-Boot load/entry: ${j.uboot_load} / ${j.uboot_entry}\neGON.FEL: ${j.egon_fel ? 'نعم' : 'لا'} — U-Boot exec sent: ${j.uboot_exec_sent ? 'نعم' : 'لا'}\n\nالتقدم:\n${ubProgressText(j)}\n\nخطوات التنفيذ:\n${steps}\n\nJSON:\n${JSON.stringify(j, null, 2)}\n\nالآن اتبع قائمة ما بعد التشغيل أدناه.`;
     const checklist = $('ubChecklist');
     if (checklist) checklist.style.display = '';
     log('bridge-spl-uboot', 'SPL + U-Boot flow completed.');

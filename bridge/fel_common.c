@@ -572,6 +572,19 @@ int fel_resolve_fd_and_params(int argc, char **argv, int nparams,
         /* termux-usb -e "cmd args" form: fd appended last. */
         fd = (int)v;
         fd_index = argc - 1;
+    } else {
+        /* v3.1: flags may precede the fd (e.g. fel_spl_uboot
+         * --validate-only <fd> <file>): skip leading "--" tokens
+         * when looking for the fd-first form. */
+        for (i = 1; i < argc; i++) {
+            if (argv[i][0] == '-' && argv[i][1] == '-')
+                continue;
+            if (token_is_decimal_fd(argv[i], &v)) {
+                fd = (int)v;
+                fd_index = i;
+            }
+            break;
+        }
     }
     if (fd < 0)
         return -1;

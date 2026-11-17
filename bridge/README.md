@@ -1,4 +1,4 @@
-# جسر Termux — ARTEMIS R69 (v3، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel)
+# جسر Termux — ARTEMIS R69 (v3.1، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel)
 
 **English summary:** A Termux bridge that lets a Samsung phone talk
 to an R69 TV Box in FEL mode over OTG. v3 adds SPL + U-Boot staging
@@ -6,15 +6,21 @@ to an R69 TV Box in FEL mode over OTG. v3 adds SPL + U-Boot staging
 implementing upstream sunxi-fel's `aw_fel_write_and_execute_spl`
 (stack swap + thunk + eGON checksum + `eGON.FEL` read-back) and
 `aw_fel_write_uboot_image` (U-Boot proper staged in DRAM at its
-mkimage load address, then executed). FEL_WRITE and FEL_EXEC
-remain confined to H3 SRAM (`0x00000000-0x00020000`), with an
-explicit confirm per write/exec and an exec rule that requires a
-prior write in the same bridge session. There is still **no eMMC /
-flash / NAND write** anywhere in the bridge. FEL_VERSION, FEL_READ
-and the pattern write/read-back were proven live on the phone on
-2026-11-17; the v3 SPL + U-Boot flow is verified from sunxi-tools
-source only and is **UNVERIFIED on real hardware** until the test
-plan below is run.
+mkimage load address, then executed). **v3.1 (2026-11-17):** the v3
+tool printed NOTHING on the phone — neither via the page nor via a
+direct Termux run — so v3.1 prints one progress JSON line per step
+immediately (plus a banner after file validation), sets stdout
+unbuffered, adds `--validate-only` / `validate_only:true` (validate
+the file + FEL_VERSION/soc, exit without any write/exec — run it
+FIRST), and prints stderr diagnostics on failed steps. FEL_WRITE
+and FEL_EXEC remain confined to H3 SRAM (`0x00000000-0x00020000`),
+with an explicit confirm per write/exec and an exec rule that
+requires a prior write in the same bridge session. There is still
+**no eMMC / flash / NAND write** anywhere in the bridge.
+FEL_VERSION, FEL_READ and the pattern write/read-back were proven
+live on the phone on 2026-11-17; the v3 SPL + U-Boot flow is
+verified from sunxi-tools source only and is **UNVERIFIED on real
+hardware** until the test plan below is run.
 
 ## الفكرة في سطر واحد
 
@@ -193,7 +199,25 @@ npm start
    الريسيت، أعد التوصيل) وأرسل التقارير.
 5. لا تنفّذ (`Exec`) النمط — إنه بيانات نصية، وليس كوداً.
 
-### (ج) SPL + U-Boot (v3) — فقط بموافقة صريحة، وبعد نجاح (أ) و(ب)
+### (ج) SPL + U-Boot (v3.1) — فقط بموافقة صريحة، وبعد نجاح (أ) و(ب)
+
+**ابدأ دائماً بـ «تحقق فقط» (v3.1) قبل التدفق الكامل.** في
+2026-11-17 طبعت أداة v3 لا شيء على الهاتف — لا عبر الصفحة
+(`fel_spl_uboot_bad_output`، ‏stdout‏ فارغ، ‏stderr‏ تحذيرات
+locale فقط، بلا خطوات) ولا عبر التشغيل المباشر في Termux
+(الأمر نفسه، بلا أي ناتج). وكان FEL_VERSION نفسه متقطعاً
+على ذلك الهاتف في الجلسة نفسها: نجح، ثم لم يرجع أي ناتج
+في مرتين متتاليتين بالأمر نفسه، ثم نجح مجدداً. التدقيق
+(انظر `docs/SOURCES.md` §6) لم يجد عطلاً حتمياً في مسار
+التحقق/فتح الجهاز — في VM تطبع الأداة خطوات التحقق الأربع
++ فشل `fel_open` — ولم يجد تجاوز مخزن مؤقت. الموت الصامت
+هو على الأرجح توقف من جهة الجهاز أو فقدان ‏stdout‏ في
+مسار termux-usb، وجعله غير قابل للتشخيص تصميم v3: سجل
+الخطوات كان يُبنى في الذاكرة ويُطبع في النهاية فقط، وstdout
+كان مخزناً بالكامل (pipe). v3.1 تطبع كل خطوة فوراً، فحتى
+الموت اللاحق يترك الخطوات المكتملة ظاهرة.
+
+**خطوة v3.1 الأولى — التحقق فقط:**
 1. **الملف المطلوب هو الملف الكامل `u-boot-sunxi-with-spl.bin`
    (559,480 بايت)، وليس SPL وحده.** البناء الحالي: U-Boot
    v2025.01 من `orangepi_pc_plus_defconfig` مع
@@ -214,18 +238,32 @@ npm start
    مرفوضة في الواجهة والخادم. العنوان مُعبأ مسبقاً بـ
    `0x00000000` (عنوان SPL لـ H3) ولا يُغيَّر.
 3. علّم على "أفهم أن هذا يكتب SPL إلى SRAM ويضع U-Boot في
-   DRAM، وليس إلى eMMC/Flash" ثم اضغط "كتابة SPL + تنفيذ
+   DRAM، وليس إلى eMMC/Flash" ثم اضغط **«تحقق فقط (بدون
+   كتابة) — v3.1»**. هذا يتحقق من الملف، ويفتح الجهاز،
+   ويفحص FEL_VERSION/H3، ثم يخرج **دون أي كتابة أو تنفيذ**
+   (مهلة 10 ثوانٍ). يجب أن ترى 4 خطوات تحقق + سطر banner،
+   ثم نتيجة `validate_only: true`.
+   - إذا نجح التحقق فقط: الأداة والنقل يعملان، ويمكنك
+     المتابعة إلى التدفق الكامل أدناه.
+   - إذا فشل التحقق فقط بصمت أيضاً (بلا خطوات): المشكلة في
+     الأداة أو في نقل termux-usb، وليست في الجهاز — أرسل
+     التقرير كاملاً ولا تتابع إلى التدفق الكامل.
+   - إذا فشل بخطوات (مثلاً `fel_open` أو FEL_VERSION):
+     أرسل الخطوات؛ الجهاز قد لا يكون في FEL أو الإذن
+     مفقود — أعد إدخال FEL وأعد الفحص.
+4. **بعد نجاح التحقق فقط**، اضغط "كتابة SPL + تنفيذ
    U-Boot (v3)". هذا يتطلب تأكيداً. **تدفق واحد**: الخادم
    يتحقق من الملف كاملاً (الحجم، SHA-256، ترويسة eGON،
    checksum، ترويسة mkimage) قبل لمس الجهاز، ثم يشغّل
    `fel_spl_uboot` (مهلة 60 ثانية)، ويعرض سجل الخطوات
    خطوة بخطوة: فحص eGON، معلومات الـstack، نسخ MMU، كتابة
    قطع SPL، تنفيذ thunk، قراءة `eGON.FEL`، استعادة MMU،
-   وضع U-Boot في DRAM، تنفيذ U-Boot.
-4. **إذا لم تظهر `eGON.FEL` في السجل: توقف ولا تتابع.**
+   وضع U-Boot في DRAM، تنفيذ U-Boot. في v3.1 تصل كل خطوة
+   إلى الصفحة فور حدوثها (مربع «التقدم»).
+5. **إذا لم تظهر `eGON.FEL` في السجل: توقف ولا تتابع.**
    أرسل سجل الخطوات كاملاً إلى Muse. لا تعِد المحاولة
    دون مراجعة.
-5. بعد التنفيذ: **قد لا يأتي رد حالة FEL أبداً** — U-Boot
+6. بعد التنفيذ: **قد لا يأتي رد حالة FEL أبداً** — U-Boot
    الذي يستلم الجهاز لا يعود إلى FEL. هذا متوقع، وليس
    بالضرورة فشلاً. اتبع **قائمة ما بعد التشغيل** في
    الصفحة:
@@ -234,7 +272,7 @@ npm start
    - اقرأ `0x00000004` (8 بايت): يجب أن تكون `eGON.FEL`
      إذا نفّذ SPL بنجاح.
    - انسخ التقرير الكامل وأرسله إلى Muse مع كل خطوة.
-6. **لا تستخدم لوحة SPL القديمة (v2) أبداً** — هي مهملة،
+7. **لا تستخدم لوحة SPL القديمة (v2) أبداً** — هي مهملة،
    وكتابتها الخام قتلت FEL في 2026-11-17.
 
 ### (د) إذا فشل SPL أو توقف FEL عن الرد
@@ -273,8 +311,15 @@ termux-usb -r -E -e "./bridge/fel_write 0x1000 /tmp/pattern.bin" /dev/bus/usb/00
 # قراءته مجدداً للمقارنة:
 termux-usb -r -E -e "./bridge/fel_read 0x1000 16" /dev/bus/usb/001/002
 
-# SPL + U-Boot (v3) مباشرة — الملف الكامل فقط، وليس spl-only.bin:
-termux-usb -r -E -e "./bridge/fel_spl_uboot /storage/emulated/0/Download/u-boot-sunxi-with-spl.bin" /dev/bus/usb/001/002
+# SPL + U-Boot (v3.1) مباشرة — الملف الكامل فقط، وليس spl-only.bin:
+# الملف على الهاتف الآن باسم بسيط بلا مسافات (نُسخ من التنزيل):
+#   cp "/storage/emulated/0/Download/u-boot-sunxi-with-spl (3).bin" /data/data/com.termux/files/home/uboot-full.bin
+# تحقق أولاً (v3.1) — بدون كتابة:
+termux-usb -r -E -e "./bridge/fel_spl_uboot --validate-only /data/data/com.termux/files/home/uboot-full.bin" /dev/bus/usb/001/002
+# أو عبر متغير البيئة:
+FEL_VALIDATE_ONLY=1 termux-usb -r -E -e "./bridge/fel_spl_uboot /data/data/com.termux/files/home/uboot-full.bin" /dev/bus/usb/001/002
+# فقط بعد نجاح التحقق فقط، التدفق الكامل:
+termux-usb -r -E -e "./bridge/fel_spl_uboot /data/data/com.termux/files/home/uboot-full.bin" /dev/bus/usb/001/002
 
 # بعدها، أعد فحص FEL_VERSION وقراءة 0x4:
 termux-usb -r -E -e "./bridge/fel_version" /dev/bus/usb/001/002
@@ -308,7 +353,7 @@ termux-usb -r -E -e "./bridge/fel_read 0x4 8" /dev/bus/usb/001/002
 | POST | `/api/bridge/fel-read` | `{device, address, length}` → SRAM + SID فقط، طول 1..4096 (مهلة 10 ثوانٍ) |
 | POST | `/api/bridge/fel-write` | `{device, address, base64, sha256, confirm:true, spl?:boolean}` → SRAM فقط، ≤ 128 KiB، SHA-256 يجب أن يطابق، `confirm` يجب أن يكون `true` حرفياً (مهلة 30 ثانية). **تحذير: `spl:true` مهمل في v3 — قتل FEL في 2026-11-17؛ استخدم `fel-spl-uboot` بدلاً منه.** |
 | POST | `/api/bridge/fel-exec` | `{device, address, confirm:true}` → مرفوض ما لم يكن العنوان داخل نطاق مكتوب في هذه الجلسة (مهلة 10 ثوانٍ) |
-| POST | `/api/bridge/fel-spl-uboot` | `{device, base64, sha256, confirm:true}` → يتحقق من الملف الكامل `u-boot-sunxi-with-spl.bin` (≤ 600KB، eGON + checksum + ترويسة mkimage + عنوان DRAM) ثم يشغّل `fel_spl_uboot`: تبديل stacks + thunk + `eGON.FEL` + وضع U-Boot في DRAM + تنفيذ (مهلة 60 ثانية). يرجع سجل الخطوات كاملاً في `steps`، وفي حالة الفشل في `detail.steps`. |
+| POST | `/api/bridge/fel-spl-uboot` | `{device, base64, sha256, confirm:true, validate_only?:boolean}` → يتحقق من الملف الكامل `u-boot-sunxi-with-spl.bin` (≤ 600KB، eGON + checksum + ترويسة mkimage + عنوان DRAM) ثم يشغّل `fel_spl_uboot`: تبديل stacks + thunk + `eGON.FEL` + وضع U-Boot في DRAM + تنفيذ (مهلة 60 ثانية؛ 10 ثوانٍ عند `validate_only:true`، دون أي كتابة أو تنفيذ). يرجع سجل الخطوات كاملاً في `steps`، وخطوات التقدم الفورية في `progress`، وفي حالة الفشل في `detail.steps`. |
 | GET | `/api/bridge/report` | آخر تقرير محفوظ، أو 404 إن لم يكن هناك تقرير |
 
 لا يوجد `/write` أو `/exec` أو `/flash` أو `/emmc` أو
@@ -323,14 +368,14 @@ bridge/
 ├── docs/SOURCES.md      # المصادر الموثقة وما هو غير مختبَر
 ├── termux-setup.sh      # تثبيت وبناء في Termux (v3)
 ├── run-bridge.sh        # تشغيل الخادم على 127.0.0.1:3001
-├── server.js            # خادم Node v3 (http المدمج فقط، بدون اعتماديات)
+├── server.js            # خادم Node v3.1 (http المدمج فقط، بدون اعتماديات)
 ├── fel_common.h/.c      # نقل FEL المشترك + allowlist + SHA-256 (GPL-2.0-or-later)
 ├── fel_version.c        # عميل FEL_VERSION للقراءة فقط (GPL-2.0-or-later)
 ├── fel_read.c           # عميل FEL_READ، SRAM + SID فقط (GPL-2.0-or-later)
 ├── fel_write.c          # عميل FEL_WRITE، SRAM فقط (GPL-2.0-or-later)
 ├── fel_exec.c           # عميل FEL_EXEC، SRAM فقط، يتطلب --confirmed (GPL-2.0-or-later)
-├── fel_spl_uboot.c      # v3: SPL + U-Boot على طريقة sunxi-fel (swap/thunk/eGON.FEL/DRAM) (GPL-2.0-or-later؛ thunk من sunxi-tools، MIT)
-├── tests/bridge.test.js # اختبارات Node بدون جهاز (22 اختباراً في v3، كلها تمر في VM بدون جهاز)
+├── fel_spl_uboot.c      # v3.1: SPL + U-Boot على طريقة sunxi-fel (swap/thunk/eGON.FEL/DRAM) + خطوات تقدم فورية + --validate-only (GPL-2.0-or-later؛ thunk من sunxi-tools، MIT)
+├── tests/bridge.test.js # اختبارات Node بدون جهاز (28 اختباراً في v3.1، كلها تمر في VM بدون جهاز)
 ├── run/                 # تقارير التشغيل + session.json (لا تُرفع إلى Git)
 └── reports/             # نسخ التقارير (لا تُرفع إلى Git)
 ```
