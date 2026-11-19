@@ -1,4 +1,4 @@
-# جسر Termux — ARTEMIS R69 (v3.3، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel + سائق المحاولات التلقائية fel_auto)
+# جسر Termux — ARTEMIS R69 (v3.3.1، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel + سائق المحاولات التلقائية fel_auto)
 
 **English summary:** A Termux bridge that lets a Samsung phone talk
 to an R69 TV Box in FEL mode over OTG. v3 adds SPL + U-Boot staging
@@ -300,6 +300,7 @@ locale فقط، بلا خطوات) ولا عبر التشغيل المباشر �
 
 1. تأكد أولاً أن FEL_VERSION يرد: شغّله مباشرة ثلاث مرات
    بفاصل ثوانٍ (`termux-usb -r -e ./bridge/fel_version <المسار>`) — هو متقطع على هذا الهاتف.
+   **v3.3.1:** بث NDJSON في fel-auto يحمل الآن نفس ترويسات CORS مثل بقية الردود (في v3.3 حجب المتصفح البث وظهر "Failed to fetch")، و`fel_spl_uboot` يعيد محاولة تبادل FEL_VERSION في الخطوة 4 ثلاث مرات بفاصل 500ms (في 2026-11-19 مات التدفق عند الخطوة 4 مع أن fel_version المباشر ردّ 3 مرات قبلها بدقائق)، وتشخيص fel-auto يعيد محاولة felVersion بنفس الطريقة، واختبار النمط يُحاوَل مرتين. بعد 3 محاولات فاشلة يبقى الخطأ نفسه، فيصنّفها السائق NEED_REENTRY كالسابق.
 2. في اللوحة: أضف حتى 4 ملفات مرشحة بالترتيب المقترح —
    **nodram أولاً** (`u-boot-sunxi-with-spl-nodram.bin`،
    SHA-256 `ce490280…`، SPL 16,384 بايت)، ثم

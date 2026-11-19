@@ -31,6 +31,15 @@
  * U-Boot staging then fails is recorded as
  * EXPECTED_UBOOT_STAGE_FAIL (DRAM was never initialised, so
  * staging to DRAM cannot work), not as a boot failure.
+ * v3.3.1: the fel-auto NDJSON stream carries the same CORS
+ * headers as every other response (v3.3 forgot them, so the
+ * browser blocked the stream — "Failed to fetch" on the phone
+ * on 2026-11-19); fel_spl_uboot retries the step-4 FEL_VERSION
+ * exchange 3 times, 500 ms apart, and the fel-auto diagnostics
+ * retry felVersion the same way (FEL_VERSION is intermittent
+ * on this phone); the diagnostics pattern test is attempted
+ * twice. No change to the SPL/U-Boot flow, the thunk, or any
+ * safety rule.
  *
  * Binds 127.0.0.1:3001 only. There is NO eMMC / flash / NAND write
  * endpoint, and there never will be one on this server: FEL_WRITE
@@ -135,7 +144,7 @@ const FEL_READ_BIN = path.join(BRIDGE_DIR, 'fel_read');
 const FEL_WRITE_BIN = path.join(BRIDGE_DIR, 'fel_write');
 const FEL_EXEC_BIN = path.join(BRIDGE_DIR, 'fel_exec');
 const FEL_SPL_UBOOT_BIN = path.join(BRIDGE_DIR, 'fel_spl_uboot');
-const VERSION = '3.3.0';
+const VERSION = '3.3.1';
 /* v3.3 fel_auto: at most 4 candidates per run (the phone user
  * picks them in the page; each full flow can take up to 60 s
  * plus diagnostics, so more would make one run unreasonably
@@ -159,6 +168,22 @@ const ALLOWED_ORIGINS = new Set([
   'http://127.0.0.1:3000',
   'http://localhost:3000',
 ]);
+
+/* CORS headers for a request, shared by send() and by the
+ * fel-auto NDJSON stream below. v3.3.1: the NDJSON handler
+ * originally called res.writeHead with no
+ * Access-Control-Allow-Origin, so the browser blocked the
+ * cross-origin (:3000 page -> :3001 bridge) stream and fetch
+ * rejected with "Failed to fetch" on the phone on 2026-11-19,
+ * even though the preflight OPTIONS and every send() response
+ * carried the header. */
+function corsHeaders(req) {
+  const origin = req && req.headers && req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    return { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
+  }
+  return {};
+}
 
 /* --- H3 allowlist (mirrors fel_common.h; enforced in both layers) --- */
 const SRAM_BASE = 0x00000000;
@@ -318,12 +343,8 @@ function send(res, status, body, req) {
     'Content-Type': 'application/json; charset=utf-8',
     'X-Content-Type-Options': 'nosniff',
     'Cache-Control': 'no-store',
+    ...corsHeaders(req),
   };
-  const origin = req && req.headers && req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    headers['Access-Control-Allow-Origin'] = origin;
-    headers['Vary'] = 'Origin';
-  }
   res.writeHead(status, headers);
   res.end(JSON.stringify(body));
 }
@@ -667,6 +688,7 @@ async function runFelAutoDiagnostics(runner, sleepMs, emit) {
     let r;
     try { r = await runner.felVersion(); } catch (e) { r = { ok: false, error: e.message }; }
     felVersionAttempts.push({ attempt: i + 1, ok: Boolean(r && r.ok),
+      attempts: (r && r.attempts) || 1,
       soc_id_hex: r && r.parsed ? (r.parsed.soc_id_hex || null) : null });
     emit({ type: 'diagnostic', name: 'fel_version', attempt: i + 1, ok: Boolean(r && r.ok) });
     if (i < 2) await sleep(sleepMs);
@@ -839,35 +861,68 @@ function buildFelAutoRunner(device) {
     fullFlow: (bytes) => runSplUboot(bytes, false),
     felVersion: async () => {
       if (!fileExists(FEL_VERSION_BIN)) return { ok: false, error: 'fel_version_not_built' };
-      const run = await runViaTermuxUsb(FEL_VERSION_BIN, device, 5000);
-      if (!run.ok) return { ok: false, error: run.error || run.message };
-      const parsed = parseToolJson(run);
-      if (!parsed || run.code !== 0 || !parsed.ok) return { ok: false, parsed: parsed || null };
-      return { ok: true, parsed };
+      // v3.3.1: retry the version exchange (3 attempts, 500 ms
+      // apart), the server-side mirror of the fel_spl_uboot
+      // step-4 retry. FEL_VERSION is intermittent on this phone
+      // (one dropped bulk reply), and the diagnostics call this
+      // once per attempt — a single dropped reply must not make
+      // a live FEL look dead. Uses the argv form of termux-usb
+      // (runViaTermuxUsb), which answered 3x in a row live on
+      // 2026-11-19; returns the first success, with the attempt
+      // count so the run log shows the retry.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const run = await runViaTermuxUsb(FEL_VERSION_BIN, device, 5000);
+        if (run.ok) {
+          const parsed = parseToolJson(run);
+          if (parsed && run.code === 0 && parsed.ok) return { ok: true, parsed, attempts: attempt };
+        }
+        if (attempt < 3) await sleep(500);
+      }
+      return { ok: false, attempts: 3 };
     },
     patternTest: async () => {
       if (!fileExists(FEL_WRITE_BIN) || !fileExists(FEL_READ_BIN)) {
         return { writeOk: false, readOk: false, match: false, error: 'fel_write/fel_read not built' };
       }
+      // v3.3.1: the pattern write/read uses the termux-usb
+      // command-string form (runViaTermuxUsbCmd) — the same form
+      // the page's FEL_READ / pattern panels use, which failed
+      // live on 2026-11-19 with "did not return JSON". That form
+      // is proven to launch the tools (v2.1 FEL_READ success;
+      // the v3 panel ran fel_spl_uboot to step 4 the same day),
+      // so a failure here is most likely a dropped bulk reply
+      // or a stale device path, not the form itself — and the
+      // tools take their parameters from the environment as a
+      // fallback, but termux-usb forwarding that environment to
+      // the child is unproven on this phone, so the server does
+      // NOT switch to an env-only invocation. Instead the whole
+      // write+read is attempted twice and the first match wins;
+      // a failure is recorded as data (match:false), never a
+      // driver crash, so the run continues to the next candidate.
       fs.mkdirSync(RUN_DIR, { recursive: true });
       const tmpFile = path.join(RUN_DIR, `fel-auto-pattern-${Date.now()}.bin`);
-      let writeParsed = null;
-      try {
-        fs.writeFileSync(tmpFile, FEL_AUTO_PATTERN);
-        const w = await runViaTermuxUsbCmd(FEL_WRITE_BIN, ['0x00001000', tmpFile],
-          device, 30000, { FEL_ADDR: '0x00001000', FEL_FILE: tmpFile });
-        writeParsed = w.ok ? parseToolJson(w) : null;
-      } finally {
-        try { fs.unlinkSync(tmpFile); } catch { /* best effort */ }
+      let last = { writeOk: false, readOk: false, match: false, attempts: 0 };
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        let writeParsed = null;
+        try {
+          fs.writeFileSync(tmpFile, FEL_AUTO_PATTERN);
+          const w = await runViaTermuxUsbCmd(FEL_WRITE_BIN, ['0x00001000', tmpFile],
+            device, 30000, { FEL_ADDR: '0x00001000', FEL_FILE: tmpFile });
+          writeParsed = w.ok ? parseToolJson(w) : null;
+        } catch { /* best effort; retry below */ }
+        const writeOk = Boolean(writeParsed && writeParsed.ok);
+        const r = await runViaTermuxUsbCmd(FEL_READ_BIN, ['0x00001000', String(FEL_AUTO_PATTERN.length)],
+          device, 10000, { FEL_ADDR: '0x00001000', FEL_LEN: String(FEL_AUTO_PATTERN.length) });
+        const readParsed = r.ok ? parseToolJson(r) : null;
+        const readOk = Boolean(readParsed && readParsed.ok);
+        const readSha256 = readParsed && readParsed.sha256 ? readParsed.sha256 : null;
+        last = { writeOk, readOk, match: writeOk && readOk && readSha256 === FEL_AUTO_PATTERN_SHA256,
+          readSha256, expectedSha256: FEL_AUTO_PATTERN_SHA256, attempts: attempt };
+        if (last.match) break;
+        if (attempt < 2) await sleep(500);
       }
-      const writeOk = Boolean(writeParsed && writeParsed.ok);
-      const r = await runViaTermuxUsbCmd(FEL_READ_BIN, ['0x00001000', String(FEL_AUTO_PATTERN.length)],
-        device, 10000, { FEL_ADDR: '0x00001000', FEL_LEN: String(FEL_AUTO_PATTERN.length) });
-      const readParsed = r.ok ? parseToolJson(r) : null;
-      const readOk = Boolean(readParsed && readParsed.ok);
-      const readSha256 = readParsed && readParsed.sha256 ? readParsed.sha256 : null;
-      return { writeOk, readOk, match: writeOk && readOk && readSha256 === FEL_AUTO_PATTERN_SHA256,
-        readSha256, expectedSha256: FEL_AUTO_PATTERN_SHA256 };
+      try { fs.unlinkSync(tmpFile); } catch { /* best effort */ }
+      return last;
     },
     usbProbe: async () => {
       if (!fileExists(USB_PROBE_BIN)) return { ok: false, error: 'usb_probe_not_built' };
@@ -927,7 +982,7 @@ function statusBody() {
     sunxiFelAvailable: commandExists('sunxi-fel'),
     writtenRanges: writtenRanges.length,
     latestReport: latestReport() ? { exists: true, generatedAt: latestReport().generatedAt || null } : { exists: false },
-    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.2: fel_spl_uboot mirrors every progress/final JSON line to stderr too and retries the eGON.FEL read-back 3 times (on 2026-11-17 the full flow stdout was lost entirely while stderr survived, and the single read-back attempt failed though FEL_VERSION itself is intermittent on this phone), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first. v3.3: fel-auto (POST /api/bridge/fel-auto) tries an ordered list of up to 4 candidate full images — validate-only first per candidate, then the full flow, diagnostics after a failure (FEL_VERSION x3, pattern write/read-back at 0x1000, usb_probe) — and moves to the next candidate without stopping at each error. It stops only for NEED_REENTRY (FEL not answering at step 4 — re-enter FEL manually and re-run), BOOT_SUCCESS, EXPECTED_UBOOT_STAGE_FAIL (nodram candidate: eGON.FEL read back, DRAM staging failed as expected because DRAM was never initialised), exhaustion, transport failure, or the user pressing Stop. No local LLM is involved: the driver is a deterministic decision tree and Muse reads the run log.',
+    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.2: fel_spl_uboot mirrors every progress/final JSON line to stderr too and retries the eGON.FEL read-back 3 times (on 2026-11-17 the full flow stdout was lost entirely while stderr survived, and the single read-back attempt failed though FEL_VERSION itself is intermittent on this phone), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first. v3.3: fel-auto (POST /api/bridge/fel-auto) tries an ordered list of up to 4 candidate full images — validate-only first per candidate, then the full flow, diagnostics after a failure (FEL_VERSION x3, pattern write/read-back at 0x1000, usb_probe) — and moves to the next candidate without stopping at each error. It stops only for NEED_REENTRY (FEL not answering at step 4 — re-enter FEL manually and re-run), BOOT_SUCCESS, EXPECTED_UBOOT_STAGE_FAIL (nodram candidate: eGON.FEL read back, DRAM staging failed as expected because DRAM was never initialised), exhaustion, transport failure, or the user pressing Stop. No local LLM is involved: the driver is a deterministic decision tree and Muse reads the run log. v3.3.1: the fel-auto NDJSON stream now carries the same CORS headers as every other response (on 2026-11-19 the browser blocked the stream and fetch rejected with "Failed to fetch"); fel_spl_uboot retries the step-4 FEL_VERSION exchange 3 times, 500 ms apart, and the fel-auto diagnostics retry felVersion the same way, because FEL_VERSION is intermittent on this phone (the 2026-11-19 nodram run died at step 4 although direct fel_version had answered 3x minutes earlier); the diagnostics pattern test is attempted twice. The error after 3 failed version attempts is unchanged, so fel-auto still classifies it as NEED_REENTRY.',
   };
 }
 
@@ -1268,10 +1323,18 @@ async function handler(req, res) {
         message: 'fel_spl_uboot binary not found; run bridge/termux-setup.sh first' }, req);
     }
     const runId = `fel-auto-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    // v3.3.1: the NDJSON stream is cross-origin (page :3000 ->
+    // bridge :3001) and the POST is preflighted, so the stream
+    // itself must carry the same CORS headers as send(); without
+    // them the browser blocks the response and fetch rejects
+    // with "Failed to fetch" (phone, 2026-11-19, twice).
     res.writeHead(200, {
       'Content-Type': 'application/x-ndjson; charset=utf-8',
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      ...corsHeaders(req),
     });
     const writeEvent = (event) => {
       try { res.write(JSON.stringify(event) + '\n'); } catch { /* client went away */ }

@@ -26,7 +26,7 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 
 const { createServer, buildTermuxUsbCmd, validateFullUbootImage, parseSplUbootOutput,
-  runFelAuto, classifyFelSplUbootFailure, validateAutoCandidates,
+  runFelAuto, classifyFelSplUbootFailure, validateAutoCandidates, buildFelAutoRunner,
   FEL_AUTO_MAX_CANDIDATES, FEL_AUTO_PATTERN_SHA256, NODRAM_SHA256 } = require('../server');
 
 function startTestServer() {
@@ -63,7 +63,7 @@ test('status is sram-only+spl-uboot+fel-auto v3.3, localhost, and reports no emm
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.mode, 'read-write-sram-only+spl-uboot+fel-auto');
-    assert.equal(body.version, '3.3.0');
+    assert.equal(body.version, '3.3.1');
     assert.equal(body.bridge, 'artemis-termux-bridge/v3');
     assert.equal(body.host, '127.0.0.1');
     assert.equal(body.emmcWriteEnabled, false);
@@ -721,7 +721,19 @@ function makeStubRunner(plan) {
     calls,
     validateOnly: async () => { calls.validateOnly++; return script('validate', calls.validateOnly - 1); },
     fullFlow: async () => { calls.fullFlow++; return script('flow', calls.fullFlow - 1); },
-    felVersion: async () => { calls.felVersion++; return { ok: Boolean(plan.felVersionOk), parsed: plan.felVersionOk ? { soc_id_hex: '0x1680' } : null }; },
+    felVersion: async () => {
+      calls.felVersion++;
+      // v3.3.1: a sequence models a dropped reply on one call
+      // (felVersionSequence: [false, true, ...]); otherwise the
+      // single felVersionOk flag applies to every call.
+      let ok;
+      if (Array.isArray(plan.felVersionSequence)) {
+        const seq = plan.felVersionSequence;
+        ok = seq[calls.felVersion - 1];
+        if (ok === undefined) ok = seq[seq.length - 1];
+      } else ok = Boolean(plan.felVersionOk);
+      return { ok, parsed: ok ? { soc_id_hex: '0x1680' } : null };
+    },
     patternTest: async () => { calls.patternTest++; return { writeOk: true, readOk: true, match: true, readSha256: FEL_AUTO_PATTERN_SHA256, expectedSha256: FEL_AUTO_PATTERN_SHA256 }; },
     usbProbe: async () => { calls.usbProbe++; return { ok: true, vid: '0x1f3a', pid: '0xefe8', endpoints: [{ address: '0x01' }, { address: '0x82' }] }; },
   };
@@ -956,4 +968,160 @@ test('v3.3: fel-auto endpoint in the VM stops with TRANSPORT_ERROR (termux-usb a
     assert.equal(final.candidates.length, 1);
     assert.equal(final.candidates[0].status, 'SKIPPED');
   } finally { await stop(server); }
+});
+
+/* --- v3.3.1: NDJSON CORS + step-4 FEL_VERSION retry --- */
+
+test('v3.3.1: fel-auto NDJSON stream carries CORS headers for an allowed origin, none for Render', async () => {
+  // Live failure 2026-11-19: the fel-auto panel failed twice with
+  // "Failed to fetch" because the NDJSON writeHead had no
+  // Access-Control-Allow-Origin while every send() response has
+  // it. The stream is cross-origin (page :3000 -> bridge :3001)
+  // and the POST is preflighted, so the browser blocks a stream
+  // without the header. In the VM termux-usb is absent, so the
+  // run ends TRANSPORT_ERROR — the headers are what this test
+  // asserts.
+  const { server, base } = await startTestServer();
+  try {
+    const allowed = await fetch(`${base}/api/bridge/fel-auto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'http://127.0.0.1:3000' },
+      body: JSON.stringify({ device: DEV, confirm: true, candidates: [autoCandidate('nodram-test')] }),
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get('access-control-allow-origin'), 'http://127.0.0.1:3000');
+    assert.match(allowed.headers.get('access-control-allow-methods') || '', /POST/);
+    const text = await allowed.text();
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(lines[lines.length - 1].type, 'final', 'stream still ends with a final line');
+
+    const render = await fetch(`${base}/api/bridge/fel-auto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://artemis-r69.onrender.com' },
+      body: JSON.stringify({ device: DEV, confirm: true, candidates: [autoCandidate('nodram-test')] }),
+    });
+    assert.equal(render.status, 200);
+    assert.equal(render.headers.get('access-control-allow-origin'), null);
+    await render.text();
+  } finally { await stop(server); }
+});
+
+test('v3.3.1: runFelAuto diagnostics survive a dropped first FEL_VERSION reply', async () => {
+  // The 2026-11-19 nodram run died at step 4 although direct
+  // fel_version had answered 3x minutes earlier: one dropped
+  // reply must not make a live FEL look dead. Here the first
+  // diagnostics felVersion call fails and the next two answer.
+  const runner = makeStubRunner({ validate: ['ok'], flow: ['egon'], felVersionSequence: [false, true, true] });
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['nodram-test']),
+    runner, sleepMs: 0,
+  });
+  assert.equal(run.outcome, 'EXHAUSTED', 'single candidate failed at eGON read-back, no more candidates');
+  assert.equal(run.candidates[0].status, 'FAILED');
+  assert.equal(run.candidates[0].failureKind, 'EGON_READBACK_FAIL');
+  const diag = run.candidates[0].diagnostics;
+  assert.ok(diag, 'diagnostics recorded');
+  assert.deepEqual(diag.felVersionAttempts.map((a) => a.ok), [false, true, true],
+    'the dropped first reply is recorded, the run still got two answers');
+  assert.equal(diag.pattern.match, true);
+  assert.equal(diag.probe.ok, true);
+  assert.equal(runner.calls.felVersion, 3, 'diagnostics still call felVersion x3');
+});
+
+test('v3.3.1: the real fel-auto runner retries felVersion 3 times when termux-usb is absent', async () => {
+  // In the VM termux-usb does not exist, so every attempt fails
+  // fast with ENOENT — the point is the retry loop runs (3
+  // attempts, ~1 s of 500 ms gaps) and returns ok:false instead
+  // of giving up after one dropped reply. The runner refuses
+  // outright when the fel_version binary is missing, so the test
+  // stages an empty placeholder at the binary's path and removes
+  // it afterwards (the working copy has no fel_version binary).
+  const fs = require('node:fs');
+  const binPath = path.join(__dirname, '..', 'fel_version');
+  const existed = fs.existsSync(binPath);
+  if (!existed) fs.writeFileSync(binPath, '');
+  try {
+    const runner = buildFelAutoRunner(DEV);
+    const started = Date.now();
+    const r = await runner.felVersion();
+    assert.equal(r.ok, false);
+    assert.equal(r.attempts, 3);
+    assert.ok(Date.now() - started >= 900, 'two 500 ms gaps between the 3 attempts');
+  } finally {
+    if (!existed) fs.unlinkSync(binPath);
+  }
+});
+
+/* C-level step-4 retry: the real fel_spl_uboot binary compiled
+ * against the stub libusb in bridge/tests/stub-libusb/ (an H3 in
+ * FEL emulator). STUB_LIBUSB_FAIL_RECV=first drops the first
+ * bulk recv — the version exchange must succeed on attempt 2.
+ * =all drops every recv — the tool must fail after 3 attempts
+ * with the UNCHANGED error string, so fel-auto still classifies
+ * it as NEED_REENTRY. Skipped when gcc is unavailable. */
+let stubToolCache = null;
+function buildStubTool() {
+  if (stubToolCache !== undefined && stubToolCache !== null) return stubToolCache;
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const { spawnSync } = require('node:child_process');
+  const hasGcc = spawnSync('sh', ['-c', 'command -v gcc'], { encoding: 'utf8' });
+  if (!hasGcc.stdout || !hasGcc.stdout.trim()) { stubToolCache = null; return null; }
+  const out = path.join(os.tmpdir(), 'fel_spl_uboot-v331-test');
+  const r = spawnSync('gcc', ['-O2', '-Wall', '-Wextra',
+    '-I', path.join(__dirname, 'stub-libusb'),
+    '-o', out,
+    path.join(__dirname, '..', 'fel_spl_uboot.c'),
+    path.join(__dirname, '..', 'fel_common.c'),
+    path.join(__dirname, 'stub-libusb', 'libusb-stub.c'),
+  ], { encoding: 'utf8', timeout: 60000 });
+  if (r.status !== 0) throw new Error(`stub-libc build failed: ${r.stderr || r.stdout}`);
+  stubToolCache = out;
+  return out;
+}
+
+test('v3.3.1: fel_spl_uboot step-4 version check succeeds on attempt 2 when the first reply is dropped', () => {
+  const bin = buildStubTool();
+  if (!bin) return; // no gcc in this environment; server tests cover the driver
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const data = makeValidUbootImage();
+  const tmp = path.join(__dirname, 'tmp-v331-retry.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const r = spawnSync(bin, ['--validate-only', '3', tmp],
+      { encoding: 'utf8', timeout: 15000, env: { ...process.env, STUB_LIBUSB_FAIL_RECV: 'first' } });
+    const lines = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+    const parsed = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const step4 = parsed.find((o) => o.progress === true && o.name === 'fel_version_soc_check');
+    assert.ok(step4, 'step-4 progress line present');
+    assert.equal(step4.ok, true);
+    assert.match(step4.detail, /attempt 2 of 3/);
+    const final = parsed[parsed.length - 1];
+    assert.equal(final.ok, true, 'validate-only passes after the retry');
+    assert.match(r.stderr, /retrying \(dropped bulk reply\?\)/, 'the dropped attempt is logged to stderr');
+  } finally { fs.unlinkSync(tmp); }
+});
+
+test('v3.3.1: fel_spl_uboot step-4 version check fails after 3 dropped replies, error unchanged (NEED_REENTRY)', () => {
+  const bin = buildStubTool();
+  if (!bin) return;
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const data = makeValidUbootImage();
+  const tmp = path.join(__dirname, 'tmp-v331-retry-all.bin');
+  fs.writeFileSync(tmp, data);
+  try {
+    const r = spawnSync(bin, ['--validate-only', '3', tmp],
+      { encoding: 'utf8', timeout: 15000, env: { ...process.env, STUB_LIBUSB_FAIL_RECV: 'all' } });
+    const lines = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+    const parsed = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const final = parsed[parsed.length - 1];
+    assert.equal(final.ok, false);
+    assert.equal(final.error, 'FEL_VERSION failed: device is not answering in FEL mode',
+      'error string unchanged so classifyFelSplUbootFailure still returns NEED_REENTRY');
+    assert.equal(classifyFelSplUbootFailure(final, final.steps), 'NEED_REENTRY');
+    assert.match(r.stderr, /3 attempts/, 'the 3-attempt failure is logged to stderr');
+  } finally { fs.unlinkSync(tmp); }
 });

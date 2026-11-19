@@ -117,10 +117,16 @@
  * diag surviving. Whether FEL really died or the transport
  * dropped the read is still open: FEL_VERSION is intermittent
  * on this phone. v3.2 answers exactly that (stderr mirror +
- * 3-attempt read-back). The exchange order, swap table, thunk
- * bytes, MMU handling and eGON checks are verified against fel.c
- * source only; no run has yet returned eGON.FEL. See
- * bridge/README.md for the phone test plan.
+ * 3-attempt read-back). v3.3.1 answers the same question one
+ * step earlier: on 2026-11-19 the flow died at step 4
+ * fel_version_soc_check ("FEL_VERSION failed") although direct
+ * fel_version had answered 3x minutes earlier on the same
+ * device path (001/005) — so the version exchange itself is
+ * retried 3 times, 500 ms apart, like the eGON read-back.
+ * The exchange order, swap table, thunk bytes, MMU handling
+ * and eGON checks are verified against fel.c source only; no
+ * run has yet returned eGON.FEL. See bridge/README.md for the
+ * phone test plan.
  */
 
 #include <stdio.h>
@@ -697,11 +703,36 @@ int main(int argc, char **argv)
     {
         unsigned char ver[32];
         uint16_t soc_id;
-        if (fel_send_request(&dev, AW_FEL_VERSION, 0, 0) != 0 ||
-            fel_read_version_reply(&dev, ver) != 0 ||
-            memcmp(ver, "AWUSBFEX", 8) != 0) {
+        /* v3.3.1: retry the FEL_VERSION exchange (3 attempts,
+         * 500 ms apart), mirroring the v3.2 eGON.FEL read-back
+         * retry. On the phone on 2026-11-19 the flow died here
+         * with "FEL_VERSION failed" although direct fel_version
+         * had answered 3x minutes earlier on the same device
+         * path (001/005): FEL_VERSION is intermittent on this
+         * phone, so one dropped bulk reply is weak evidence
+         * that FEL is gone. AW_FEL_VERSION is an idempotent
+         * query, so re-sending it after a dropped reply is
+         * safe. Each failed attempt is logged to stderr; the
+         * successful attempt is recorded in the step detail.
+         * After 3 failed attempts the error is unchanged, so
+         * fel-auto still classifies it as NEED_REENTRY. */
+        int attempt, version_ok = 0;
+        for (attempt = 1; attempt <= 3; attempt++) {
+            if (fel_send_request(&dev, AW_FEL_VERSION, 0, 0) == 0 &&
+                fel_read_version_reply(&dev, ver) == 0 &&
+                memcmp(ver, "AWUSBFEX", 8) == 0) {
+                version_ok = 1;
+                break;
+            }
+            if (attempt < 3) {
+                diag("fel_version_soc_check",
+                     "FEL_VERSION exchange failed, retrying (dropped bulk reply?)");
+                usleep(500000);
+            }
+        }
+        if (!version_ok) {
             diag("fel_version_soc_check",
-                 "FEL_VERSION failed: device is not answering in FEL mode");
+                 "FEL_VERSION failed: device is not answering in FEL mode (3 attempts)");
             snprintf(g_error, sizeof(g_error),
                      "%s", "FEL_VERSION failed: device is not answering in FEL mode");
             g_failed = 1;
@@ -711,9 +742,9 @@ int main(int argc, char **argv)
         soc_id_checked = soc_id;
         {
             char d[128];
-            snprintf(d, sizeof(d), "soc_id 0x%04x (%s), scratchpad 0x%04x",
+            snprintf(d, sizeof(d), "soc_id 0x%04x (%s), scratchpad 0x%04x (attempt %d of 3)",
                      soc_id, fel_soc_name(soc_id),
-                     fel_get_le32(ver + 20) & 0xffffu);
+                     fel_get_le32(ver + 20) & 0xffffu, attempt);
             STEP("fel_version_soc_check", soc_id == 0x1680, d);
         }
         CHECK(soc_id == 0x1680,
