@@ -1,4 +1,4 @@
-# جسر Termux — ARTEMIS R69 (v3.1، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel)
+# جسر Termux — ARTEMIS R69 (v3.3، قراءة FEL + كتابة SRAM فقط + SPL/U-Boot على طريقة sunxi-fel + سائق المحاولات التلقائية fel_auto)
 
 **English summary:** A Termux bridge that lets a Samsung phone talk
 to an R69 TV Box in FEL mode over OTG. v3 adds SPL + U-Boot staging
@@ -290,6 +290,41 @@ locale فقط، بلا خطوات) ولا عبر التشغيل المباشر �
 - إذا لم يظهر `eGON.FEL`: أرسل سجل الخطوات كاملاً قبل أي
   محاولة أخرى.
 
+## المحاولات التلقائية (v3.3 — fel_auto)
+
+لوحة «محاولات تلقائية (v3.3)» في صفحة الجسر تجرّب قائمة
+مرشحين بالترتيب دون توقف عند كل خطأ — لا حاجة للضغط على
+كل محاولة يدوياً. **لا يوجد ذكاء اصطناعي محلي على الهاتف:**
+السائق شجرة قرارات حتمية في الخادم، والذكاء هو Muse في
+السحابة يقرأ سجل التشغيل الذي يكتبه السائق.
+
+1. تأكد أولاً أن FEL_VERSION يرد: شغّله مباشرة ثلاث مرات
+   بفاصل ثوانٍ (`termux-usb -r -e ./bridge/fel_version <المسار>`) — هو متقطع على هذا الهاتف.
+2. في اللوحة: أضف حتى 4 ملفات مرشحة بالترتيب المقترح —
+   **nodram أولاً** (`u-boot-sunxi-with-spl-nodram.bin`،
+   SHA-256 `ce490280…`، SPL 16,384 بايت)، ثم
+   336+ZQ3650393، ثم 300+ZQ3750393 (عندما تُبنى). لكل
+   مرشح: تسمية، وخانة nodram (تُفعَّل تلقائياً إذا كان
+   الملف هو nodram أو اسمه يحتوي nodram)، وأزرار
+   ترتيب/حذف.
+3. فعّل خانة SRAM-only واضغط «بدء المحاولات التلقائية».
+   لكل مرشح: «تحقق فقط» أولاً، ثم المحاولة الكاملة، وبعد
+   الفشل تشخيص تلقائي (FEL_VERSION ×3، اختبار النمط عند
+   0x1000، usb_probe)، ثم المرشح التالي. التقدم يظهر حياً
+   في صندوق التقدم، وسجل التشغيل يُحفظ على الهاتف في
+   `bridge/run/fel-auto-<timestamp>.json` و`.log`.
+4. يتوقف السائق فقط عند: **نجاح الإقلاع** (BOOT_SUCCESS)،
+   أو **FEL لا يرد عند الخطوة 4** (NEED_REENTRY — أعد
+   إدخال FEL يدوياً بالدبوس كما في (د) أعلاه، ثم أعد
+   التشغيل؛ لا تحاول مرشحاً آخر قبل ذلك)، أو **نتيجة
+   nodram المتوقعة** (EXPECTED_UBOOT_STAGE_FAIL — قرأ
+   eGON.FEL لكن وضع U-Boot في DRAM فشل كما هو متوقع لأن
+   DRAM لم تُهيأ؛ هذه إجابة الاختبار، لا فشل إقلاع)، أو
+   نفاد المرشحين (EXHAUSTED)، أو زر «إيقاف» (يتوقف بعد
+   انتهاء المحاولة الحالية، قبل المرشح التالي).
+5. انسخ سجل التشغيل كاملاً (زر «نسخ سجل التشغيل») وأرسله
+   إلى Muse — لا تعيد تشغيل نفس الملفات دون توجيه جديد.
+
 ## إذا فشلت صفحة الجسر (البديل المباشر في Termux)
 
 إذا رجعت `/api/bridge/fel-read` أو `fel-write` أو `fel-exec`
@@ -346,7 +381,7 @@ termux-usb -r -E -e "./bridge/fel_read 0x4 8" /dev/bus/usb/001/002
 
 | الطريقة | المسار | ماذا يفعل |
 |---|---|---|
-| GET | `/api/bridge/status` | حالة الجسر v3، `read-write-sram-only+spl-uboot`، لا يحتاج جهازاً |
+| GET | `/api/bridge/status` | حالة الجسر v3.3، `read-write-sram-only+spl-uboot+fel-auto`، لا يحتاج جهازاً |
 | GET | `/api/bridge/session` | النطاقات المكتوبة في هذه الجلسة (العنوان، الطول، SHA-256) |
 | POST | `/api/bridge/probe` | `{device}` → يشغّل `usb_probe` عبر `termux-usb -e` (مهلة 10 ثوانٍ) |
 | POST | `/api/bridge/fel-version` | `{device}` → يشغّل `fel_version` عبر `termux-usb -e` (مهلة 5 ثوانٍ) |
@@ -354,6 +389,8 @@ termux-usb -r -E -e "./bridge/fel_read 0x4 8" /dev/bus/usb/001/002
 | POST | `/api/bridge/fel-write` | `{device, address, base64, sha256, confirm:true, spl?:boolean}` → SRAM فقط، ≤ 128 KiB، SHA-256 يجب أن يطابق، `confirm` يجب أن يكون `true` حرفياً (مهلة 30 ثانية). **تحذير: `spl:true` مهمل في v3 — قتل FEL في 2026-11-17؛ استخدم `fel-spl-uboot` بدلاً منه.** |
 | POST | `/api/bridge/fel-exec` | `{device, address, confirm:true}` → مرفوض ما لم يكن العنوان داخل نطاق مكتوب في هذه الجلسة (مهلة 10 ثوانٍ) |
 | POST | `/api/bridge/fel-spl-uboot` | `{device, base64, sha256, confirm:true, validate_only?:boolean}` → يتحقق من الملف الكامل `u-boot-sunxi-with-spl.bin` (≤ 600KB، eGON + checksum + ترويسة mkimage + عنوان DRAM) ثم يشغّل `fel_spl_uboot`: تبديل stacks + thunk + `eGON.FEL` + وضع U-Boot في DRAM + تنفيذ (مهلة 60 ثانية؛ 10 ثوانٍ عند `validate_only:true`، دون أي كتابة أو تنفيذ). يرجع سجل الخطوات كاملاً في `steps`، وخطوات التقدم الفورية في `progress`، وفي حالة الفشل في `detail.steps`. |
+| POST | `/api/bridge/fel-auto` | `{device, candidates:[{label, base64, sha256, nodram?}], confirm:true}` → سائق المحاولات التلقائية v3.3: حتى 4 مرشحين بالترتيب، «تحقق فقط» لكل مرشح ثم التدفق الكامل، تشخيص تلقائي بعد الفشل (FEL_VERSION ×3، نمط 0x1000، usb_probe)، ويتوقف فقط عند BOOT_SUCCESS أو NEED_REENTRY أو EXPECTED_UBOOT_STAGE_FAIL أو نفاد المرشحين أو إيقاف المستخدم. **الرد NDJSON** (سطر JSON لكل حدث حي، والسطر الأخير `{"type":"final", ...run}`)؛ سجل التشغيل يُحفظ في `bridge/run/fel-auto-<timestamp>.json` و`.log`. |
+| POST | `/api/bridge/fel-auto/stop` | `{runId}` → يطلب إيقاف تشغيل fel-auto جارٍ (يتوقف بعد انتهاء المحاولة الحالية، قبل المرشح التالي) |
 | GET | `/api/bridge/report` | آخر تقرير محفوظ، أو 404 إن لم يكن هناك تقرير |
 
 لا يوجد `/write` أو `/exec` أو `/flash` أو `/emmc` أو
@@ -368,7 +405,7 @@ bridge/
 ├── docs/SOURCES.md      # المصادر الموثقة وما هو غير مختبَر
 ├── termux-setup.sh      # تثبيت وبناء في Termux (v3)
 ├── run-bridge.sh        # تشغيل الخادم على 127.0.0.1:3001
-├── server.js            # خادم Node v3.1 (http المدمج فقط، بدون اعتماديات)
+├── server.js            # خادم Node v3.3 (http المدمج فقط، بدون اعتماديات) + سائق fel_auto
 ├── fel_common.h/.c      # نقل FEL المشترك + allowlist + SHA-256 (GPL-2.0-or-later)
 ├── fel_version.c        # عميل FEL_VERSION للقراءة فقط (GPL-2.0-or-later)
 ├── fel_read.c           # عميل FEL_READ، SRAM + SID فقط (GPL-2.0-or-later)

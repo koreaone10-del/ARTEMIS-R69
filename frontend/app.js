@@ -521,3 +521,215 @@ $('askAI').addEventListener('click',async()=>{const prompt=$('aiPrompt').value.t
 document.querySelectorAll('[data-prompt]').forEach(b=>b.addEventListener('click',()=>{$('aiPrompt').value=b.dataset.prompt;$('aiPrompt').focus();}));
 $('exportReport').addEventListener('click',()=>{const report={schema:'artemis-r69-report/v1',generatedAt:new Date().toISOString(),product:'ARTEMIS R69 v6.1',target:'SHUNJUEY R69-EMCP V2.0',mode:'READ_ONLY',device:{socExpected:'Allwinner H3',socIdExpected:'0x1680',board:'dolphin-p1',emcpReported:'SanDisk SD9DS28K-8G'},usb:state.usb?{vendorId:state.usb.vendorId,productId:state.usb.productId,felVersionRead:false}:null,firmware:state.firmwareAnalysis,dram:state.dram,partitions:state.partitions,bootArtifacts:state.boot,logs:state.logs,safety:{felWrite:'sram-only (bridge v3)',felExec:'sram-only, session-gated (bridge v3)',felSplUboot:'upstream sunxi-fel swap/thunk + eGON.FEL check, DRAM staging at mkimage load address (bridge v3)',emmcWrite:false,ramPatternTest:false,recoveryImageBuilder:false,note:'No persistent writes or arbitrary execution are implemented. FEL_WRITE / FEL_EXEC are confined to H3 SRAM and require a prior write in the same bridge session. The v2 raw SPL write is deprecated: it killed FEL on 2026-11-17; SPL upload uses the v3 fel-spl-uboot flow only.'}};downloadBlob(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'ARTEMIS_R69_diagnostic_report.json');$('reportPreview').textContent=JSON.stringify({generatedAt:report.generatedAt,mode:report.mode,firmwareEntries:report.firmware?.count||0,bootArtifacts:report.bootArtifacts.length,logEntries:report.logs.length,safety:report.safety},null,2);log('report','Exported diagnostic JSON report.');});
 fetch('/api/ai/status').then(r=>r.json()).then(j=>{document.getElementById('aiMode').textContent=j.endpointConfigured?`AI endpoint configured • ${j.model} • ${j.authentication}`:'Offline rules active — configure a no-key local model endpoint for generative AI';}).catch(()=>{document.getElementById('aiMode').textContent='AI status unavailable';});
+
+// Termux bridge v3.3: fel_auto — automatic attempt driver.
+// Tries an ordered candidate list without stopping at each
+// error: validate-only first per candidate, then the full
+// fel_spl_uboot flow, diagnostics after a failure, then the
+// next candidate. It stops only on BOOT_SUCCESS, NEED_REENTRY
+// (FEL not answering at step 4 — re-enter FEL manually and
+// re-run), EXPECTED_UBOOT_STAGE_FAIL (nodram candidate:
+// eGON.FEL read back, DRAM staging failed as expected because
+// DRAM was never initialised), exhaustion, or the Stop button.
+// No local LLM is involved: the driver is a deterministic
+// decision tree and Muse reads the run log.
+const AUTO_MAX_CANDIDATES = 4;
+const NODRAM_SHA256 = 'ce490280899193e292a2aa3d46f81be3e635f5b9cdc06fa655d678559ccce0db';
+let autoCandidates = []; // {name, bytes, sha256, label, nodram}
+let autoRunId = null, autoAbort = null, autoLogText = '';
+function updateAutoStartButton() {
+  const btn = $('autoStart');
+  if (btn) btn.disabled = !(autoCandidates.length > 0 && $('autoAcknowledge')?.checked);
+}
+function renderAutoList() {
+  const box = $('autoList');
+  if (!box) return;
+  if (autoCandidates.length === 0) { box.textContent = 'لم تتم إضافة أي مرشح بعد.'; updateAutoStartButton(); return; }
+  box.innerHTML = '';
+  autoCandidates.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'border:1px solid var(--hatch-widget-border, #ccc);border-radius:8px;padding:8px;margin:6px 0;display:flex;flex-direction:column;gap:6px';
+    const head = document.createElement('div');
+    head.textContent = `${i + 1}. ${c.name} — ${c.bytes.length} بايت، SHA-256: ${c.sha256.slice(0, 16)}…`;
+    const labelRow = document.createElement('div');
+    labelRow.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+    const labelInput = document.createElement('input');
+    labelInput.value = c.label;
+    labelInput.placeholder = 'التسمية (مثال: nodram-test)';
+    labelInput.style.cssText = 'flex:1;min-width:140px';
+    labelInput.addEventListener('input', () => { c.label = labelInput.value.trim() || c.name; });
+    const nodram = document.createElement('label');
+    nodram.style.cssText = 'display:flex;gap:4px;align-items:center;font-size:12px';
+    const nodramBox = document.createElement('input');
+    nodramBox.type = 'checkbox';
+    nodramBox.checked = c.nodram;
+    nodramBox.addEventListener('change', () => { c.nodram = nodramBox.checked; });
+    nodram.append(nodramBox, document.createTextNode('nodram (بدون DRAM)'));
+    labelRow.append(labelInput, nodram);
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:6px';
+    const up = document.createElement('button');
+    up.className = 'ghost'; up.textContent = '↑'; up.disabled = i === 0;
+    up.addEventListener('click', () => { [autoCandidates[i - 1], autoCandidates[i]] = [autoCandidates[i], autoCandidates[i - 1]]; renderAutoList(); });
+    const down = document.createElement('button');
+    down.className = 'ghost'; down.textContent = '↓'; down.disabled = i === autoCandidates.length - 1;
+    down.addEventListener('click', () => { [autoCandidates[i + 1], autoCandidates[i]] = [autoCandidates[i], autoCandidates[i + 1]]; renderAutoList(); });
+    const remove = document.createElement('button');
+    remove.className = 'ghost'; remove.textContent = 'حذف';
+    remove.addEventListener('click', () => { autoCandidates.splice(i, 1); renderAutoList(); });
+    btnRow.append(up, down, remove);
+    row.append(head, labelRow, btnRow);
+    box.append(row);
+  });
+  updateAutoStartButton();
+}
+$('autoFile')?.addEventListener('change', async e => {
+  const files = [...(e.target.files || [])];
+  const meta = $('autoList');
+  for (const f of files) {
+    if (autoCandidates.length >= AUTO_MAX_CANDIDATES) { if (meta) meta.textContent += `\nتجاهل ${f.name}: الحد ${AUTO_MAX_CANDIDATES} مرشحين لكل تشغيل.`; break; }
+    try {
+      const buf = new Uint8Array(await f.arrayBuffer());
+      if (buf.length > UB_MAX_FILE) { if (meta) meta.textContent = `الملف ${f.name} كبير جداً: ${buf.length} بايت (الحد 600KB).`; continue; }
+      const v = ubValidateHeaders(buf);
+      if (!v.ok) { if (meta) meta.textContent = `الملف ${f.name} مرفوض: ${v.error}`; continue; }
+      const sha256 = await sha256Hex(buf);
+      const nodram = sha256 === NODRAM_SHA256 || /nodram/i.test(f.name);
+      const label = nodram ? 'nodram-test' : f.name.replace(/\.bin$/i, '').replace(/[^a-zA-Z0-9_+-]+/g, '-').slice(0, 40);
+      autoCandidates.push({ name: f.name, bytes: buf, sha256, label, nodram });
+      log('bridge-fel-auto-file', `fel-auto candidate added: ${f.name} (${buf.length} bytes, nodram=${nodram}).`);
+    } catch (err) { if (meta) meta.textContent = `تعذّرت قراءة ${f.name}: ${err.message}`; }
+  }
+  e.target.value = '';
+  renderAutoList();
+});
+$('autoAcknowledge')?.addEventListener('change', updateAutoStartButton);
+function autoAppendLine(text) {
+  autoLogText += text + '\n';
+  const box = $('autoProgress');
+  if (!box) return;
+  box.style.display = '';
+  box.textContent = autoLogText;
+  box.scrollTop = box.scrollHeight;
+}
+function autoOutcomeText(outcome, detail) {
+  switch (outcome) {
+    case 'BOOT_SUCCESS': return `✓ نجح الإقلاع — ${detail || ''}\n\nالخطوة التالية: أعد فحص FEL_VERSION. إذا ردّ، فـ U-Boot لم يستلم الجهاز. انسخ سجل التشغيل كاملاً وأرسله إلى Muse.`;
+    case 'NEED_REENTRY': return `✗ FEL لا يرد عند الخطوة 4 (fel_version_soc_check) — لا تحاول مرشحاً آخر قبل إصلاح هذا.\n\nالخطوة التالية (يدوية، لا يمكن لأي سكربت القيام بها):\n1) أطفئ TV Box.\n2) اضغط دبوس Reset داخل منفذ AV وأبقه مضغوطاً.\n3) وصّل USB بالهاتف، ثم أفلت الدبوس.\n4) في Termux: termux-usb -l ثم termux-usb -r <المسار الجديد>، وشغّل fel_version ثلاث مرات بفاصل ثوانٍ.\n5) عندما يرد FEL_VERSION بـ H3 (0x1680) ثلاث مرات، أعد تشغيل المحاولات التلقائية من هذه اللوحة.\n\n${detail || ''}`;
+    case 'EXPECTED_UBOOT_STAGE_FAIL': return `✓ النتيجة الحاسمة لاختبار nodram: قرأ eGON.FEL — SPL عاد إلى FEL، إذن تهيئة DRAM ليست هي من يقتل FEL.\n\nفشل وضع U-Boot في DRAM بعد ذلك متوقع، لأن هذا SPL لم يهيّئ DRAM أبداً. هذه ليست نتيجة إقلاع فاشلة — إنها إجابة الاختبار.\n\nالخطوة التالية: انسخ سجل التشغيل كاملاً وأرسله إلى Muse. لا تعيد المحاولة بنفس الملفات؛ الخطوة التالية بناء بدون رفع تردد CPU أو متغير واحد ZQ/CLK.\n\n${detail || ''}`;
+    case 'EXHAUSTED': return `جرّبنا كل المرشحين ولم يقلع أيهم.\n\nالخطوة التالية: انسخ سجل التشغيل كاملاً وأرسله إلى Muse — لا تعيد تشغيل نفس الملفات.\n\n${detail || ''}`;
+    case 'TRANSPORT_ERROR': return `✗ تعذّر الوصول إلى termux-usb أو إلى أداة fel_spl_uboot.\n\nالخطوة التالية: تأكد أن الجسر يعمل (bash bridge/run-bridge.sh)، وأن termux-usb -l يظهر الجهاز، ثم أعد المحاولة.\n\n${detail || ''}`;
+    case 'STOPPED': return `أوقفت التشغيل يدوياً.\n\nالخطوة التالية: أعد فحص FEL_VERSION قبل أي محاولة جديدة.\n\n${detail || ''}`;
+    default: return `${outcome || 'غير معروف'}\n\n${detail || 'انسخ سجل التشغيل كاملاً وأرسله إلى Muse.'}`;
+  }
+}
+$('autoStart')?.addEventListener('click', async () => {
+  const out = $('autoResult'), banner = $('autoOutcome');
+  if (!out) return;
+  if (autoCandidates.length === 0) { out.textContent = 'أضف مرشحاً واحداً على الأقل أولاً.'; return; }
+  let device;
+  try { device = bridgeDeviceOrThrow(); } catch (e) { out.textContent = e.message; return; }
+  if (!confirm(`بدء المحاولات التلقائية مع ${autoCandidates.length} مرشح(ين) بالترتيب؟\nلكل مرشح: تحقق فقط، ثم المحاولة الكاملة (SPL + thunk + eGON.FEL + U-Boot في DRAM)، ثم تشخيص تلقائي عند الفشل.\nيكتب إلى SRAM وDRAM فقط — لا يكتب إلى eMMC أو Flash. قد يستغرق التشغيل عدة دقائق. لا تفصل الجهاز ولا تغلق الصفحة.`)) return;
+  autoLogText = '';
+  autoRunId = null;
+  autoAbort = new AbortController();
+  if (banner) banner.style.display = 'none';
+  const startBtn = $('autoStart'), stopBtn = $('autoStop');
+  if (startBtn) startBtn.disabled = true;
+  if (stopBtn) stopBtn.disabled = false;
+  out.textContent = 'جارٍ بدء المحاولات التلقائية… قد يستغرق التشغيل عدة دقائق (حتى 60 ثانية لكل محاولة + تشخيص).';
+  try {
+    const payload = {
+      device, confirm: true,
+      candidates: autoCandidates.map((c) => ({
+        label: c.label, base64: base64EncodeBytes(c.bytes), sha256: c.sha256, nodram: c.nodram,
+      })),
+    };
+    // Direct fetch + NDJSON streaming (not bridgeCall): the
+    // server sends one JSON line per event as it happens, and
+    // the last line is {"type":"final", ...run}.
+    const r = await fetch(BRIDGE_BASE + '/api/bridge/fel-auto', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), signal: autoAbort.signal,
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+      out.textContent = `رفض السائق التشغيل (${j.error || r.status}): ${j.message || ''}\n\nأصلح الخطأ أعلاه (عادة SHA-256 أو ملف مرفوض) قبل إعادة المحاولة.`;
+      log('bridge-fel-auto-error', `fel-auto rejected: ${j.error || r.status}`);
+      return;
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '', finalRun = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'run_start') {
+          autoRunId = ev.runId;
+          autoAppendLine(`بدأ التشغيل ${ev.runId} — الجهاز ${ev.device}\nالمرشحون: ${ev.candidates.map((c, i) => `${i + 1}. ${c.label}${c.nodram ? ' (nodram)' : ''}`).join(' | ')}`);
+        } else if (ev.type === 'candidate_start') {
+          autoAppendLine(`\n— المرشح ${ev.index + 1}: ${ev.label} (SHA ${String(ev.sha256).slice(0, 12)}…${ev.nodram ? ' — nodram' : ''})`);
+        } else if (ev.type === 'candidate_validated') {
+          autoAppendLine(`  ✓ تحقق فقط ناجح لـ ${ev.label} — الملف صالح وFEL_VERSION يرد.`);
+        } else if (ev.type === 'candidate_result') {
+          autoAppendLine(`  ${ev.status === 'BOOT_SUCCESS' ? '✓' : '✗'} ${ev.label}: ${ev.status}${ev.kind ? ` [${ev.kind}]` : ''}${ev.error ? ` — ${ev.error}` : ''}${ev.reason ? ` — ${ev.reason}` : ''}`);
+        } else if (ev.type === 'diagnostic') {
+          if (ev.name === 'fel_version') autoAppendLine(`  تشخيص FEL_VERSION محاولة ${ev.attempt}: ${ev.ok ? '✓ ردّ' : '✗ لم يرد'}`);
+          else if (ev.name === 'pattern') autoAppendLine(`  تشخيص النمط 0x1000: ${ev.ok ? '✓ تطابق SHA-256 — مسار bulk حي' : `✗ فشل (كتابة ${ev.detail?.writeOk ? '✓' : '✗'} / قراءة ${ev.detail?.readOk ? '✓' : '✗'} / تطابق ${ev.detail?.match ? '✓' : '✗'})`}`);
+          else if (ev.name === 'usb_probe') autoAppendLine(`  تشخيص usb_probe: ${ev.ok ? `✓ الجهاز ما زال يُرى على USB (${ev.detail?.vid || ''}:${ev.detail?.pid || ''})` : '✗ لا يظهر على USB'}`);
+        } else if (ev.type === 'run_finished') {
+          autoAppendLine(`\nالنتيجة: ${ev.outcome}`);
+        } else if (ev.type === 'final') {
+          finalRun = ev;
+        }
+      }
+    }
+    if (finalRun) {
+      bridgeSetReport(finalRun);
+      if (banner) {
+        banner.style.display = '';
+        banner.textContent = autoOutcomeText(finalRun.outcome, finalRun.outcomeDetail);
+      }
+      const per = (finalRun.candidates || []).map((c) => `- ${c.label}: ${c.status}${c.failureKind ? ` [${c.failureKind}]` : ''}${c.error ? ` — ${c.error}` : ''}`).join('\n');
+      out.textContent = `انتهى التشغيل — النتيجة: ${finalRun.outcome}\n\n${per}\n\nسجل التشغيل محفوظ على الهاتف: ${finalRun.logFiles ? `${finalRun.logFiles.json}` : '(غير محفوظ)'}\n\nانسخ سجل التشغيل من الأسفل وأرسله كاملاً إلى Muse.`;
+      log('bridge-fel-auto', `fel-auto finished: ${finalRun.outcome}`);
+    } else {
+      out.textContent = 'انتهى الاتصال دون نتيجة نهائية من السائق. أعد فحص FEL_VERSION، وانسخ سجل التقدم أعلاه وأرسله إلى Muse.';
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') out.textContent = 'أوقفت التشغيل من الصفحة. أعد فحص FEL_VERSION قبل أي محاولة جديدة.';
+    else out.textContent = `فشل التشغيل: ${e.message}\n\nأعد فحص FEL_VERSION: إذا ردّ، فـ FEL ما زال حياً. انسخ سجل التقدم أعلاه وأرسله إلى Muse.`;
+    log('bridge-fel-auto-error', e.message);
+  } finally {
+    if (startBtn) startBtn.disabled = false;
+    if (stopBtn) stopBtn.disabled = true;
+    autoAbort = null;
+    updateAutoStartButton();
+  }
+});
+$('autoStop')?.addEventListener('click', async () => {
+  const out = $('autoResult');
+  if (autoRunId) {
+    try {
+      await fetch(BRIDGE_BASE + '/api/bridge/fel-auto/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ runId: autoRunId }) });
+    } catch { /* the abort below is the fallback */ }
+  }
+  if (autoAbort) autoAbort.abort();
+  autoAppendLine('\n— أوقف المستخدم التشغيل (سيتوقف السائق بعد انتهاء المحاولة الحالية، قبل المرشح التالي).');
+  if (out) out.textContent = 'طلب إيقاف… سيتوقف السائق بعد انتهاء المحاولة الحالية (حتى 60 ثانية) وقبل المرشح التالي.';
+  log('bridge-fel-auto-stop', 'User pressed Stop on fel-auto.');
+});
+$('autoCopyLog')?.addEventListener('click', async () => {
+  const out = $('autoResult');
+  const text = autoLogText || '(لا يوجد سجل بعد — شغّل المحاولات التلقائية أولاً.)';
+  try { await navigator.clipboard.writeText(text); if (out) out.textContent = 'تم نسخ سجل التشغيل. أرسله إلى Muse للتحليل.\n\n' + text; }
+  catch { if (out) out.textContent = 'تعذّر النسخ التلقائي. حدّد نص سجل التقدم أعلاه وانسخه يدوياً.\n\n' + text; }
+});

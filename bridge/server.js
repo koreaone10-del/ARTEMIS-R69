@@ -11,6 +11,26 @@
  * single read-back attempt failed though FEL_VERSION itself is
  * intermittent on this phone. parseSplUbootOutput now reads
  * progress/banner/final from stderr as well.
+ * v3.3: fel_auto — an automatic attempt driver
+ * (POST /api/bridge/fel-auto, runFelAuto). It tries an ordered
+ * list of candidate full images (validate-only first per
+ * candidate, then the full fel_spl_uboot flow), runs diagnostics
+ * automatically after a failure (FEL_VERSION x3, pattern
+ * write/read-back at 0x1000, usb_probe), and moves to the next
+ * candidate without stopping at each error. It STOPS and waits
+ * for the human only when FEL needs physical re-entry (the
+ * 2026-11-17 no-DRAM failure shape: the flow dies at step 4
+ * fel_version_soc_check, "FEL_VERSION failed"), when a boot
+ * succeeds, when the candidates are exhausted, or when the user
+ * presses Stop. There is NO local LLM on the phone: the driver
+ * is a deterministic decision tree, and the intelligence is
+ * Muse in the cloud reading the run log it writes to
+ * bridge/run/fel-auto-<timestamp>.json/.log. FEL re-entry
+ * (reset pin in the AV port) remains manual — no script can do
+ * it. A nodram candidate whose eGON.FEL reads back but whose
+ * U-Boot staging then fails is recorded as
+ * EXPECTED_UBOOT_STAGE_FAIL (DRAM was never initialised, so
+ * staging to DRAM cannot work), not as a boot failure.
  *
  * Binds 127.0.0.1:3001 only. There is NO eMMC / flash / NAND write
  * endpoint, and there never will be one on this server: FEL_WRITE
@@ -49,6 +69,8 @@
  *   POST /api/bridge/fel-write    {device, address, base64, sha256, confirm:true, spl?:boolean}
  *   POST /api/bridge/fel-exec     {device, address, confirm:true}
  *   POST /api/bridge/fel-spl-uboot {device, base64, sha256, confirm:true, validate_only?:boolean}
+ *   POST /api/bridge/fel-auto {device, candidates:[{label, base64, sha256, nodram?:boolean}], confirm:true}
+ *   POST /api/bridge/fel-auto/stop {runId}
  *   GET  /api/bridge/session      written ranges in this session
  *   GET  /api/bridge/report
  *
@@ -113,7 +135,17 @@ const FEL_READ_BIN = path.join(BRIDGE_DIR, 'fel_read');
 const FEL_WRITE_BIN = path.join(BRIDGE_DIR, 'fel_write');
 const FEL_EXEC_BIN = path.join(BRIDGE_DIR, 'fel_exec');
 const FEL_SPL_UBOOT_BIN = path.join(BRIDGE_DIR, 'fel_spl_uboot');
-const VERSION = '3.2.0';
+const VERSION = '3.3.0';
+/* v3.3 fel_auto: at most 4 candidates per run (the phone user
+ * picks them in the page; each full flow can take up to 60 s
+ * plus diagnostics, so more would make one run unreasonably
+ * long). The pattern bytes are the same HELLO-FEL-PATTERN
+ * string the v2 pattern test writes (28 bytes; the UI label
+ * says 16, the code uses the real length). */
+const FEL_AUTO_MAX_CANDIDATES = 4;
+const FEL_AUTO_PATTERN = Buffer.from('HELLO-FEL-PATTERN-0123456789', 'utf8');
+const FEL_AUTO_PATTERN_SHA256 = crypto.createHash('sha256').update(FEL_AUTO_PATTERN).digest('hex');
+const NODRAM_SHA256 = 'ce490280899193e292a2aa3d46f81be3e635f5b9cdc06fa655d678559ccce0db';
 
 const HOST = '127.0.0.1';
 if (process.env.BRIDGE_HOST && process.env.BRIDGE_HOST !== HOST) {
@@ -519,6 +551,339 @@ function parseSplUbootOutput(run) {
   return { final, progress, banner };
 }
 
+/* --- v3.3 fel_auto: automatic attempt driver ---
+ * The driver is a deterministic decision tree, NOT a local LLM:
+ * the intelligence is Muse in the cloud reading the run log.
+ * It is written so the core (runFelAuto) can run in the VM
+ * against a stub runner, while the real runner below uses the
+ * same termux-usb helpers as the single-attempt endpoints.
+ *
+ * Runner interface (both real and stub):
+ *   validateOnly(bytes) -> { transport?:boolean, parsed, progress, banner, error? }
+ *   fullFlow(bytes)     -> same shape
+ *   felVersion()        -> { ok, parsed? }
+ *   patternTest()       -> { writeOk, readOk, match, readSha256, expectedSha256 }
+ *   usbProbe()          -> { ok, vid?, pid?, endpoints? }
+ * A runner result with transport:true means termux-usb itself
+ * (or the binary) is unavailable — the run cannot proceed at
+ * all, and the driver stops with TRANSPORT_ERROR instead of
+ * burning candidates against a missing transport.
+ *
+ * Candidate classification (from the fel_spl_uboot final JSON):
+ *   NEED_REENTRY — the flow died at step 4 fel_version_soc_check
+ *     ("FEL_VERSION failed: device is not answering in FEL
+ *     mode") or the step log stops right after
+ *     validate_uboot_header with no fel_version_soc_check step.
+ *     This is the exact shape of the 2026-11-17 no-DRAM run,
+ *     which never wrote or executed anything. FEL is dead (or
+ *     was never alive for this run); trying the next candidate
+ *     against a dead FEL would only repeat the same failure,
+ *     so the driver stops and tells the user to re-enter FEL
+ *     and re-run. Diagnostics still run (FEL_VERSION x3 +
+ *     usb_probe) to confirm the classification.
+ *   EGON_READBACK_FAIL — the thunk ran (steps 0-12 ok) but the
+ *     eGON.FEL read-back failed after 3 attempts. The 336 and
+ *     300 MHz builds both failed this way on 2026-11-17.
+ *   UBOOT_STAGE_FAIL — eGON.FEL read back, but staging U-Boot
+ *     proper to DRAM failed. For a nodram candidate this is
+ *     EXPECTED (DRAM was never initialised), see below.
+ *   FLOW_FAIL — anything else (thunk exec, MMU, SPL write…).
+ *
+ * Outcomes: BOOT_SUCCESS | EXPECTED_UBOOT_STAGE_FAIL |
+ * NEED_REENTRY | TRANSPORT_ERROR | EXHAUSTED. */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function classifyFelSplUbootFailure(parsed, progress) {
+  if (!parsed) return 'FLOW_FAIL';
+  const err = String(parsed.error || '');
+  const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+  const prog = Array.isArray(progress) ? progress : [];
+  const stepNames = new Set([...steps.map((s) => s.name), ...prog.map((s) => s.name)]);
+  if (err.includes('FEL_VERSION failed') ||
+      (steps.length > 0 && steps[steps.length - 1].name === 'validate_uboot_header' &&
+        !stepNames.has('fel_version_soc_check'))) {
+    return 'NEED_REENTRY';
+  }
+  if (err.includes('could not read back') || err.includes('egon_fel_readback') ||
+      err.includes('FEL stopped answering after the thunk')) {
+    return 'EGON_READBACK_FAIL';
+  }
+  if (err.includes('U-Boot staging') || err.includes('DRAM may not be initialised')) {
+    return 'UBOOT_STAGE_FAIL';
+  }
+  return 'FLOW_FAIL';
+}
+
+function validateAutoCandidates(candidates) {
+  if (!Array.isArray(candidates) || candidates.length < 1) {
+    return { ok: false, error: 'no_candidates',
+      message: 'fel-auto needs 1..4 candidates, each {label, base64, sha256}' };
+  }
+  if (candidates.length > FEL_AUTO_MAX_CANDIDATES) {
+    return { ok: false, error: 'too_many_candidates',
+      message: `fel-auto accepts at most ${FEL_AUTO_MAX_CANDIDATES} candidates per run` };
+  }
+  const items = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i] || {};
+    const label = typeof c.label === 'string' && c.label.trim()
+      ? c.label.trim().slice(0, 80) : `candidate-${i + 1}`;
+    if (typeof c.base64 !== 'string' || !c.base64) {
+      return { ok: false, error: 'invalid_data', message: `candidate ${label}: base64 data is required` };
+    }
+    let bytes;
+    try { bytes = Buffer.from(c.base64, 'base64'); } catch {
+      return { ok: false, error: 'invalid_data', message: `candidate ${label}: base64 could not be decoded` };
+    }
+    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    if (typeof c.sha256 !== 'string' || c.sha256.toLowerCase() !== sha256) {
+      return { ok: false, error: 'sha256_mismatch',
+        message: `candidate ${label}: sha256 does not match the base64 data; refused before touching the device`,
+        expected: sha256 };
+    }
+    const validated = validateFullUbootImage(bytes);
+    if (!validated.ok) {
+      return { ok: false, error: validated.error,
+        message: `candidate ${label}: ${validated.message}` };
+    }
+    const nodram = c.nodram === true ||
+      /nodram/i.test(label) || sha256 === NODRAM_SHA256;
+    items.push({ label, nodram, bytes, sha256, validated });
+  }
+  return { ok: true, items };
+}
+
+/* Diagnostics run after a failed attempt (and, for NEED_REENTRY,
+ * to confirm FEL really is dead). FEL_VERSION x3 with 5 s gaps:
+ * FEL_VERSION is intermittent on this phone, so one silence
+ * proves nothing. Pattern write/read-back at 0x1000 proves the
+ * bulk path is still alive; usb_probe proves USB enumeration
+ * still works (control transfers) even when FEL bulk is dead. */
+async function runFelAutoDiagnostics(runner, sleepMs, emit) {
+  const felVersionAttempts = [];
+  for (let i = 0; i < 3; i++) {
+    let r;
+    try { r = await runner.felVersion(); } catch (e) { r = { ok: false, error: e.message }; }
+    felVersionAttempts.push({ attempt: i + 1, ok: Boolean(r && r.ok),
+      soc_id_hex: r && r.parsed ? (r.parsed.soc_id_hex || null) : null });
+    emit({ type: 'diagnostic', name: 'fel_version', attempt: i + 1, ok: Boolean(r && r.ok) });
+    if (i < 2) await sleep(sleepMs);
+  }
+  let pattern;
+  try { pattern = await runner.patternTest(); } catch (e) { pattern = { writeOk: false, readOk: false, match: false, error: e.message }; }
+  emit({ type: 'diagnostic', name: 'pattern', ok: Boolean(pattern && pattern.match), detail: pattern });
+  let probe;
+  try { probe = await runner.usbProbe(); } catch (e) { probe = { ok: false, error: e.message }; }
+  emit({ type: 'diagnostic', name: 'usb_probe', ok: Boolean(probe && probe.ok), detail: probe });
+  return { felVersionAttempts, pattern, probe };
+}
+
+async function runFelAuto({ device, candidates, runner, sleepMs = 5000, onEvent = () => {}, isStopped = () => false }) {
+  const startedAt = new Date().toISOString();
+  const logLines = [];
+  const emit = (event) => {
+    const line = `[${new Date().toISOString()}] ${event.type}: ${JSON.stringify(event)}`;
+    logLines.push(line);
+    onEvent(event);
+  };
+  const results = [];
+  let outcome = 'EXHAUSTED';
+  let outcomeDetail = '';
+  for (let idx = 0; idx < candidates.length; idx++) {
+    if (isStopped()) { outcome = 'STOPPED'; outcomeDetail = 'Stopped by the user before candidate ' + (idx + 1); break; }
+    const cand = candidates[idx];
+    emit({ type: 'candidate_start', index: idx, label: cand.label, sha256: cand.sha256, nodram: cand.nodram });
+    const result = { index: idx, label: cand.label, sha256: cand.sha256, nodram: cand.nodram, status: null };
+    results.push(result);
+    // 1) validate-only first: file + FEL_VERSION/soc, no write.
+    let vo;
+    try { vo = await runner.validateOnly(cand.bytes); } catch (e) { vo = { transport: false, parsed: null, error: e.message }; }
+    if (vo.transport) {
+      result.status = 'SKIPPED';
+      result.reason = 'transport_error: termux-usb or fel_spl_uboot is unavailable; no candidate can run';
+      outcome = 'TRANSPORT_ERROR';
+      outcomeDetail = result.reason;
+      emit({ type: 'candidate_result', index: idx, label: cand.label, status: result.status, reason: result.reason });
+      break;
+    }
+    if (!vo.parsed || !vo.parsed.ok) {
+      const kind = classifyFelSplUbootFailure(vo.parsed, vo.progress);
+      result.validateOnly = { ok: false, error: vo.parsed ? vo.parsed.error : (vo.error || 'no result'), kind };
+      emit({ type: 'candidate_result', index: idx, label: cand.label, status: 'VALIDATE_FAILED', kind, error: result.validateOnly.error });
+      if (kind === 'NEED_REENTRY') {
+        result.status = 'NEED_REENTRY';
+        result.diagnostics = await runFelAutoDiagnostics(runner, sleepMs, emit);
+        outcome = 'NEED_REENTRY';
+        outcomeDetail = 'FEL was not answering at fel_version_soc_check (step 4) before any write. Re-enter FEL (power off, hold the reset pin in the AV port, connect USB, release), confirm FEL_VERSION answers, then re-run fel-auto. Do not retry against a dead FEL.';
+        break;
+      }
+      result.status = 'SKIPPED';
+      result.reason = `validate-only failed (${kind}); candidate skipped, moving to the next candidate`;
+      continue;
+    }
+    result.validateOnly = { ok: true };
+    emit({ type: 'candidate_validated', index: idx, label: cand.label });
+    if (isStopped()) { outcome = 'STOPPED'; outcomeDetail = 'Stopped by the user after validate-only for ' + cand.label; break; }
+    // 2) full flow: SPL write + thunk + eGON.FEL + U-Boot staging + exec.
+    let flow;
+    try { flow = await runner.fullFlow(cand.bytes); } catch (e) { flow = { transport: false, parsed: null, error: e.message }; }
+    if (flow.transport) {
+      result.status = 'SKIPPED';
+      result.reason = 'transport_error during the full flow';
+      outcome = 'TRANSPORT_ERROR';
+      outcomeDetail = result.reason;
+      emit({ type: 'candidate_result', index: idx, label: cand.label, status: result.status, reason: result.reason });
+      break;
+    }
+    result.steps = flow.parsed && Array.isArray(flow.parsed.steps) ? flow.parsed.steps : [];
+    result.progress = flow.progress || [];
+    if (flow.parsed && flow.parsed.ok) {
+      result.status = 'BOOT_SUCCESS';
+      result.detail = flow.parsed;
+      outcome = 'BOOT_SUCCESS';
+      outcomeDetail = `SPL + U-Boot flow completed for ${cand.label} (eGON.FEL read back, U-Boot staged and exec sent). Re-check FEL_VERSION: a reply means U-Boot did not take over.`;
+      emit({ type: 'candidate_result', index: idx, label: cand.label, status: 'BOOT_SUCCESS' });
+      break;
+    }
+    const kind = classifyFelSplUbootFailure(flow.parsed, flow.progress);
+    result.failureKind = kind;
+    result.error = flow.parsed ? flow.parsed.error : (flow.error || 'no result');
+    emit({ type: 'candidate_result', index: idx, label: cand.label, status: 'FAILED', kind, error: result.error });
+    if (kind === 'NEED_REENTRY') {
+      result.status = 'NEED_REENTRY';
+      result.diagnostics = await runFelAutoDiagnostics(runner, sleepMs, emit);
+      outcome = 'NEED_REENTRY';
+      outcomeDetail = 'FEL stopped answering at fel_version_soc_check (step 4). Re-enter FEL (power off, hold the reset pin in the AV port, connect USB, release), confirm FEL_VERSION answers, then re-run fel-auto.';
+      break;
+    }
+    if (kind === 'UBOOT_STAGE_FAIL' && cand.nodram) {
+      // Decisive for the nodram test: eGON.FEL read back (the
+      // SPL ran and returned), but staging U-Boot to DRAM cannot
+      // work because this SPL never initialised DRAM. That is
+      // the expected result for a nodram candidate, not a boot
+      // failure — and it proves DRAM init was NOT the thing
+      // killing FEL (FEL stayed alive past the thunk). Stop
+      // here: the next candidate needs a human decision.
+      result.status = 'EXPECTED_UBOOT_STAGE_FAIL';
+      outcome = 'EXPECTED_UBOOT_STAGE_FAIL';
+      outcomeDetail = `eGON.FEL read back for the nodram candidate ${cand.label} — the SPL ran and returned, so DRAM init was not killing FEL. U-Boot staging to DRAM then failed as expected, because this SPL never initialised DRAM. Stop here and report this to Muse: the next step is a no-CPU-clock-raise build or a single-variable ZQ/CLK build, not another blind retry.`;
+      emit({ type: 'candidate_result', index: idx, label: cand.label, status: 'EXPECTED_UBOOT_STAGE_FAIL' });
+      break;
+    }
+    // EGON_READBACK_FAIL / FLOW_FAIL / UBOOT_STAGE_FAIL
+    // (non-nodram): run diagnostics, then move on.
+    result.diagnostics = await runFelAutoDiagnostics(runner, sleepMs, emit);
+    result.status = 'FAILED';
+    if (isStopped()) { outcome = 'STOPPED'; outcomeDetail = 'Stopped by the user after diagnostics for ' + cand.label; break; }
+  }
+  if (outcome === 'EXHAUSTED') {
+    outcomeDetail = 'All candidates were tried and none booted. Send the run log to Muse; do not re-run the same files.';
+  }
+  const finishedAt = new Date().toISOString();
+  const run = { ok: outcome === 'BOOT_SUCCESS', outcome, outcomeDetail, device,
+    startedAt, finishedAt, candidates: results, logLines };
+  emit({ type: 'run_finished', outcome, outcomeDetail });
+  return run;
+}
+
+function saveFelAutoLog(run) {
+  try {
+    fs.mkdirSync(RUN_DIR, { recursive: true });
+    const stamp = new Date(run.startedAt).toISOString().replace(/[:.]/g, '-');
+    const base = path.join(RUN_DIR, `fel-auto-${stamp}`);
+    fs.writeFileSync(`${base}.json`, JSON.stringify(run, null, 2));
+    const human = [
+      `fel-auto run ${run.startedAt} -> ${run.finishedAt}`,
+      `device: ${run.device}`,
+      `outcome: ${run.outcome}`,
+      run.outcomeDetail,
+      '',
+      ...run.candidates.map((c) => `- ${c.label} (${c.sha256.slice(0, 12)}…): ${c.status}${c.failureKind ? ` [${c.failureKind}]` : ''}${c.error ? ` — ${c.error}` : ''}`),
+      '',
+      ...run.logLines,
+    ].join('\n');
+    fs.writeFileSync(`${base}.log`, human);
+    return { json: `${base}.json`, log: `${base}.log` };
+  } catch { return null; }
+}
+
+/* Real runner: the same termux-usb helpers the single-attempt
+ * endpoints use. Each attempt writes its candidate bytes to a
+ * server temp file and deletes it afterwards. */
+function buildFelAutoRunner(device) {
+  async function runSplUboot(bytes, validateOnly) {
+    if (!fileExists(FEL_SPL_UBOOT_BIN)) {
+      return { transport: true, parsed: null, progress: [], banner: null, error: 'fel_spl_uboot_not_built' };
+    }
+    fs.mkdirSync(RUN_DIR, { recursive: true });
+    const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+    const tmpFile = path.join(RUN_DIR, `fel-auto-${Date.now()}-${sha.slice(0, 8)}.bin`);
+    let run;
+    try {
+      fs.writeFileSync(tmpFile, bytes);
+      run = await runViaTermuxUsbCmd(FEL_SPL_UBOOT_BIN,
+        [tmpFile, ...(validateOnly ? ['--validate-only'] : [])],
+        device, validateOnly ? 10000 : 60000,
+        { FEL_FILE: tmpFile, ...(validateOnly ? { FEL_VALIDATE_ONLY: '1' } : {}) });
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch { /* best effort */ }
+    }
+    if (!run.ok) return { transport: true, parsed: null, progress: [], banner: null, error: run.error || run.message };
+    const out = parseSplUbootOutput(run);
+    return { transport: false, parsed: out.final, progress: out.progress, banner: out.banner };
+  }
+  return {
+    validateOnly: (bytes) => runSplUboot(bytes, true),
+    fullFlow: (bytes) => runSplUboot(bytes, false),
+    felVersion: async () => {
+      if (!fileExists(FEL_VERSION_BIN)) return { ok: false, error: 'fel_version_not_built' };
+      const run = await runViaTermuxUsb(FEL_VERSION_BIN, device, 5000);
+      if (!run.ok) return { ok: false, error: run.error || run.message };
+      const parsed = parseToolJson(run);
+      if (!parsed || run.code !== 0 || !parsed.ok) return { ok: false, parsed: parsed || null };
+      return { ok: true, parsed };
+    },
+    patternTest: async () => {
+      if (!fileExists(FEL_WRITE_BIN) || !fileExists(FEL_READ_BIN)) {
+        return { writeOk: false, readOk: false, match: false, error: 'fel_write/fel_read not built' };
+      }
+      fs.mkdirSync(RUN_DIR, { recursive: true });
+      const tmpFile = path.join(RUN_DIR, `fel-auto-pattern-${Date.now()}.bin`);
+      let writeParsed = null;
+      try {
+        fs.writeFileSync(tmpFile, FEL_AUTO_PATTERN);
+        const w = await runViaTermuxUsbCmd(FEL_WRITE_BIN, ['0x00001000', tmpFile],
+          device, 30000, { FEL_ADDR: '0x00001000', FEL_FILE: tmpFile });
+        writeParsed = w.ok ? parseToolJson(w) : null;
+      } finally {
+        try { fs.unlinkSync(tmpFile); } catch { /* best effort */ }
+      }
+      const writeOk = Boolean(writeParsed && writeParsed.ok);
+      const r = await runViaTermuxUsbCmd(FEL_READ_BIN, ['0x00001000', String(FEL_AUTO_PATTERN.length)],
+        device, 10000, { FEL_ADDR: '0x00001000', FEL_LEN: String(FEL_AUTO_PATTERN.length) });
+      const readParsed = r.ok ? parseToolJson(r) : null;
+      const readOk = Boolean(readParsed && readParsed.ok);
+      const readSha256 = readParsed && readParsed.sha256 ? readParsed.sha256 : null;
+      return { writeOk, readOk, match: writeOk && readOk && readSha256 === FEL_AUTO_PATTERN_SHA256,
+        readSha256, expectedSha256: FEL_AUTO_PATTERN_SHA256 };
+    },
+    usbProbe: async () => {
+      if (!fileExists(USB_PROBE_BIN)) return { ok: false, error: 'usb_probe_not_built' };
+      const run = await runViaTermuxUsb(USB_PROBE_BIN, device, 10000);
+      if (!run.ok || run.code !== 0) return { ok: false, error: run.error || run.message };
+      return { ok: true, ...parseProbeOutput(run.stdout) };
+    },
+  };
+}
+
+/* Stop flags for in-flight fel-auto runs (the page's Stop
+ * button). The driver checks the flag between candidates and
+ * after validate-only; a run already inside a 60 s full-flow
+ * attempt finishes that attempt, then stops. */
+const felAutoStopFlags = new Set();
+
 function parseProbeOutput(stdout) {
   const vidPid = stdout.match(/VID:PID\s+([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})/);
   const get = (label) => {
@@ -545,12 +910,13 @@ function statusBody() {
     ok: true,
     bridge: 'artemis-termux-bridge/v3',
     version: VERSION,
-    mode: 'read-write-sram-only+spl-uboot',
+    mode: 'read-write-sram-only+spl-uboot+fel-auto',
     host: HOST,
     port: PORT,
     felWriteEnabled: true,
     felExecEnabled: true,
     felSplUbootAvailable: fileExists(FEL_SPL_UBOOT_BIN),
+    felAutoAvailable: fileExists(FEL_SPL_UBOOT_BIN),
     emmcWriteEnabled: false,
     termuxUsbAvailable: commandExists('termux-usb'),
     usbProbeAvailable: fileExists(USB_PROBE_BIN),
@@ -561,7 +927,7 @@ function statusBody() {
     sunxiFelAvailable: commandExists('sunxi-fel'),
     writtenRanges: writtenRanges.length,
     latestReport: latestReport() ? { exists: true, generatedAt: latestReport().generatedAt || null } : { exists: false },
-    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.2: fel_spl_uboot mirrors every progress/final JSON line to stderr too and retries the eGON.FEL read-back 3 times (on 2026-11-17 the full flow stdout was lost entirely while stderr survived, and the single read-back attempt failed though FEL_VERSION itself is intermittent on this phone), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first.',
+    note: 'v3.1: FEL_READ (SRAM + SID only), FEL_WRITE and FEL_EXEC are SRAM-only (0x00000000-0x00020000). SPL + U-Boot staging (POST /api/bridge/fel-spl-uboot) implements the upstream sunxi-fel stack swap + thunk (fel.c aw_fel_write_and_execute_spl) and stages U-Boot proper in DRAM at its mkimage load address; eMMC / flash / NAND writing is still disabled: there is no endpoint for it. FEL_EXEC requires a prior FEL_WRITE in this session. The v2 raw SPL write (fel-write spl:true) is DEPRECATED: it killed FEL on 2026-11-17. Use fel-spl-uboot instead. v3.2: fel_spl_uboot mirrors every progress/final JSON line to stderr too and retries the eGON.FEL read-back 3 times (on 2026-11-17 the full flow stdout was lost entirely while stderr survived, and the single read-back attempt failed though FEL_VERSION itself is intermittent on this phone), and fel-spl-uboot accepts validate_only:true, which validates the file + FEL_VERSION/soc and exits without any write or exec — run that first. v3.3: fel-auto (POST /api/bridge/fel-auto) tries an ordered list of up to 4 candidate full images — validate-only first per candidate, then the full flow, diagnostics after a failure (FEL_VERSION x3, pattern write/read-back at 0x1000, usb_probe) — and moves to the next candidate without stopping at each error. It stops only for NEED_REENTRY (FEL not answering at step 4 — re-enter FEL manually and re-run), BOOT_SUCCESS, EXPECTED_UBOOT_STAGE_FAIL (nodram candidate: eGON.FEL read back, DRAM staging failed as expected because DRAM was never initialised), exhaustion, transport failure, or the user pressing Stop. No local LLM is involved: the driver is a deterministic decision tree and Muse reads the run log.',
   };
 }
 
@@ -864,6 +1230,89 @@ async function handler(req, res) {
     try { saveReport(report); } catch { /* see probe */ }
     return send(res, 200, report, req);
   }
+  if (req.method === 'POST' && url.pathname === '/api/bridge/fel-auto/stop') {
+    let body = {};
+    try { body = await readJson(req); } catch (e) { return send(res, e.status || 400, { ok: false, error: 'invalid_json' }, req); }
+    const runId = typeof body.runId === 'string' ? body.runId : null;
+    if (!runId) return send(res, 400, { ok: false, error: 'invalid_run_id', message: 'runId is required' }, req);
+    felAutoStopFlags.add(runId);
+    return send(res, 200, { ok: true, runId, stopped: true,
+      message: 'Stop requested: the driver will stop after the current attempt finishes (at most 60 s) and before the next candidate.' }, req);
+  }
+  if (req.method === 'POST' && url.pathname === '/api/bridge/fel-auto') {
+    // v3.3: automatic attempt driver. Validates every candidate
+    // server-side (SHA-256 + eGON + mkimage, same as fel-spl-uboot)
+    // BEFORE any device access, then runs runFelAuto with the real
+    // runner. The response is NDJSON: one JSON line per progress
+    // event as it happens, and the last line is
+    // {"type":"final", ...run} with the full run log. The page
+    // reads the stream and renders events live; a plain fetch
+    // .json() on this endpoint will fail — read it line by line.
+    // A run can take minutes (up to 4 candidates x 60 s flow +
+    // diagnostics), so there is no fixed HTTP timeout here: the
+    // driver itself bounds each attempt.
+    let body = {};
+    try { body = await readJson(req, 5 * 1024 * 1024); } catch (e) { return send(res, e.status || 400, { ok: false, error: 'invalid_json' }, req); }
+    const resolved = await resolveDevice(body.device);
+    if (!resolved.ok) return send(res, resolved.status, { ok: false, error: resolved.error, message: resolved.message, devices: resolved.devices }, req);
+    if (body.confirm !== true) {
+      return send(res, 400, { ok: false, error: 'confirm_required',
+        message: 'fel-auto requires confirm:true in the request body' }, req);
+    }
+    const checked = validateAutoCandidates(body.candidates);
+    if (!checked.ok) {
+      return send(res, 400, { ok: false, error: checked.error, message: checked.message, expected: checked.expected }, req);
+    }
+    if (!fileExists(FEL_SPL_UBOOT_BIN)) {
+      return send(res, 501, { ok: false, error: 'fel_spl_uboot_not_built',
+        message: 'fel_spl_uboot binary not found; run bridge/termux-setup.sh first' }, req);
+    }
+    const runId = `fel-auto-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    const writeEvent = (event) => {
+      try { res.write(JSON.stringify(event) + '\n'); } catch { /* client went away */ }
+    };
+    writeEvent({ type: 'run_start', runId, device: resolved.device,
+      candidates: checked.items.map((c) => ({ label: c.label, sha256: c.sha256, nodram: c.nodram })) });
+    try {
+      const runner = buildFelAutoRunner(resolved.device);
+      const run = await runFelAuto({
+        device: resolved.device,
+        candidates: checked.items,
+        runner,
+        sleepMs: 5000,
+        onEvent: writeEvent,
+        isStopped: () => felAutoStopFlags.has(runId),
+      });
+      felAutoStopFlags.delete(runId);
+      const logFiles = saveFelAutoLog(run);
+      if (run.ok) {
+        // Record the SPL range as written in this session, as
+        // the fel-spl-uboot endpoint does.
+        const winner = checked.items[run.candidates.findIndex((c) => c.status === 'BOOT_SUCCESS')] ||
+          checked.items[0];
+        recordWrite({
+          address: SPL_ADDR, address_hex: hexAddr(SPL_ADDR),
+          length: winner.validated.spl_len,
+          sha256: crypto.createHash('sha256').update(winner.bytes.subarray(0, winner.validated.spl_len)).digest('hex'),
+          spl: true, uboot: true, felAuto: true,
+          writtenAt: new Date().toISOString(), device: resolved.device,
+        });
+      }
+      writeEvent({ type: 'final', runId, logFiles, ...run });
+    } catch (e) {
+      felAutoStopFlags.delete(runId);
+      writeEvent({ type: 'final', runId, ok: false, outcome: 'DRIVER_ERROR',
+        outcomeDetail: `fel-auto driver error: ${e.message}`, device: resolved.device,
+        startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
+        candidates: [], logLines: [] });
+    }
+    return res.end();
+  }
   if (req.method === 'POST' && url.pathname === '/api/bridge/fel-exec') {
     let body = {};
     try { body = await readJson(req); } catch (e) { return send(res, e.status || 400, { ok: false, error: 'invalid_json' }, req); }
@@ -934,4 +1383,7 @@ module.exports = { server, handler, createServer, HOST, PORT, VERSION,
   parseAddress, parseLength, readAllowed, writeAllowed, execAllowed,
   inSram, inSid, hexAddr, writtenRanges, buildTermuxUsbCmd,
   parseSplUbootOutput,
-  validateFullUbootImage, UB_MAX_FILE, SPL_LEN_LIMIT };
+  validateFullUbootImage, UB_MAX_FILE, SPL_LEN_LIMIT,
+  runFelAuto, classifyFelSplUbootFailure, validateAutoCandidates,
+  FEL_AUTO_MAX_CANDIDATES, FEL_AUTO_PATTERN_SHA256, NODRAM_SHA256,
+  buildFelAutoRunner, saveFelAutoLog };

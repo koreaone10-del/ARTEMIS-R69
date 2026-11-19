@@ -25,7 +25,9 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
-const { createServer, buildTermuxUsbCmd, validateFullUbootImage, parseSplUbootOutput } = require('../server');
+const { createServer, buildTermuxUsbCmd, validateFullUbootImage, parseSplUbootOutput,
+  runFelAuto, classifyFelSplUbootFailure, validateAutoCandidates,
+  FEL_AUTO_MAX_CANDIDATES, FEL_AUTO_PATTERN_SHA256, NODRAM_SHA256 } = require('../server');
 
 function startTestServer() {
   return new Promise((resolve, reject) => {
@@ -53,18 +55,20 @@ async function post(base, p, body) {
 
 const DEV = '/dev/bus/usb/001/004';
 
-test('status is sram-only+spl-uboot v3, localhost, and reports no emmc capability', async () => {
+test('status is sram-only+spl-uboot+fel-auto v3.3, localhost, and reports no emmc capability', async () => {
   const { server, base } = await startTestServer();
   try {
     const res = await fetch(`${base}/api/bridge/status`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.ok, true);
-    assert.equal(body.mode, 'read-write-sram-only+spl-uboot');
+    assert.equal(body.mode, 'read-write-sram-only+spl-uboot+fel-auto');
+    assert.equal(body.version, '3.3.0');
     assert.equal(body.bridge, 'artemis-termux-bridge/v3');
     assert.equal(body.host, '127.0.0.1');
     assert.equal(body.emmcWriteEnabled, false);
     assert.equal(typeof body.felSplUbootAvailable, 'boolean');
+    assert.equal(typeof body.felAutoAvailable, 'boolean');
     assert.equal(typeof body.felReadAvailable, 'boolean');
     assert.equal(typeof body.felWriteAvailable, 'boolean');
     assert.equal(typeof body.felExecAvailable, 'boolean');
@@ -686,5 +690,270 @@ test('v3.1: fel-spl-uboot validate-only with a bad file is still refused before 
     });
     assert.equal(status, 400);
     assert.equal(body.error, 'bad_egon');
+  } finally { await stop(server); }
+});
+
+/* --- v3.3: fel_auto — automatic attempt driver --- */
+
+/* Stub runner: plays a canned script per candidate, counting
+ * every call, so the driver decision tree can be tested end to
+ * end in the VM with no device and no termux-usb. */
+function makeStubRunner(plan) {
+  const calls = { validateOnly: 0, fullFlow: 0, felVersion: 0, patternTest: 0, usbProbe: 0 };
+  const step = (name, ok = true, detail = '') => ({ step: 0, name, ok, detail });
+  const egonFailSteps = [
+    'validate_file_size', 'validate_egon_header', 'validate_egon_checksum',
+    'validate_uboot_header', 'fel_version_soc_check', 'get_stackinfo',
+    'mmu_backup_and_disable', 'mmu_generate_table', 'spl_write_piece',
+    'spl_write_piece_backup', 'spl_write_piece', 'spl_write_piece_backup',
+    'thunk_exec',
+  ].map((n) => step(n));
+  const script = (kind, idx) => {
+    const entry = (plan[kind] || [])[idx];
+    if (entry === 'ok') return { transport: false, parsed: { ok: true, egon_fel: true, uboot_exec_sent: true, steps: egonFailSteps }, progress: egonFailSteps, banner: null };
+    if (entry === 'egon') return { transport: false, parsed: { ok: false, error: 'SPL: could not read back the SPL header (FEL stopped answering after the thunk, 3 attempts)', steps: egonFailSteps }, progress: egonFailSteps, banner: null };
+    if (entry === 'need_reentry') return { transport: false, parsed: { ok: false, error: 'FEL_VERSION failed: device is not answering in FEL mode', steps: egonFailSteps.slice(0, 4) }, progress: egonFailSteps.slice(0, 4), banner: null };
+    if (entry === 'uboot_stage') return { transport: false, parsed: { ok: false, error: 'U-Boot staging write failed (DRAM may not be initialised: SPL may have failed to init DRAM)', steps: [...egonFailSteps, step('egon_fel_readback'), step('mmu_restore_and_enable')] }, progress: [], banner: null };
+    if (entry === 'transport') return { transport: true, parsed: null, progress: [], banner: null, error: 'termux_usb_unavailable' };
+    return { transport: false, parsed: { ok: true, egon_fel: true, uboot_exec_sent: true, steps: egonFailSteps }, progress: egonFailSteps, banner: null };
+  };
+  return {
+    calls,
+    validateOnly: async () => { calls.validateOnly++; return script('validate', calls.validateOnly - 1); },
+    fullFlow: async () => { calls.fullFlow++; return script('flow', calls.fullFlow - 1); },
+    felVersion: async () => { calls.felVersion++; return { ok: Boolean(plan.felVersionOk), parsed: plan.felVersionOk ? { soc_id_hex: '0x1680' } : null }; },
+    patternTest: async () => { calls.patternTest++; return { writeOk: true, readOk: true, match: true, readSha256: FEL_AUTO_PATTERN_SHA256, expectedSha256: FEL_AUTO_PATTERN_SHA256 }; },
+    usbProbe: async () => { calls.usbProbe++; return { ok: true, vid: '0x1f3a', pid: '0xefe8', endpoints: [{ address: '0x01' }, { address: '0x82' }] }; },
+  };
+}
+
+function autoCandidate(label, overrides = {}) {
+  const data = makeValidUbootImage();
+  return {
+    label,
+    base64: data.toString('base64'),
+    sha256: crypto.createHash('sha256').update(data).digest('hex'),
+    ...overrides,
+  };
+}
+function checkedCandidates(labels) {
+  const checked = validateAutoCandidates(labels.map((l) => autoCandidate(l)));
+  assert.equal(checked.ok, true, JSON.stringify(checked));
+  return checked.items;
+}
+
+test('v3.3: classifyFelSplUbootFailure distinguishes the 2026-11-17 failure shapes', () => {
+  assert.equal(FEL_AUTO_MAX_CANDIDATES, 4);
+  // Step-4 shape: flow died at fel_version_soc_check, steps stop
+  // right after validate_uboot_header, error is the FEL_VERSION
+  // message — the exact 2026-11-17 no-DRAM run.
+  const needReentry = {
+    ok: false, error: 'FEL_VERSION failed: device is not answering in FEL mode',
+    steps: [
+      { name: 'validate_file_size' }, { name: 'validate_egon_header' },
+      { name: 'validate_egon_checksum' }, { name: 'validate_uboot_header' },
+    ],
+  };
+  assert.equal(classifyFelSplUbootFailure(needReentry, needReentry.steps), 'NEED_REENTRY');
+  // Same classification from the error string alone, even with an
+  // empty step log (the v3 silent case).
+  assert.equal(classifyFelSplUbootFailure({ ok: false, error: 'FEL_VERSION failed: device is not answering in FEL mode', steps: [] }, []), 'NEED_REENTRY');
+  // Thunk ran, eGON.FEL read-back failed after 3 attempts — the
+  // 336 and 300 MHz builds, 2026-11-17.
+  assert.equal(classifyFelSplUbootFailure({
+    ok: false, error: 'SPL: could not read back the SPL header (FEL stopped answering after the thunk, 3 attempts)',
+    steps: [{ name: 'thunk_exec' }],
+  }, []), 'EGON_READBACK_FAIL');
+  // eGON.FEL read back, DRAM staging failed.
+  assert.equal(classifyFelSplUbootFailure({
+    ok: false, error: 'U-Boot staging write failed (DRAM may not be initialised: SPL may have failed to init DRAM)',
+    steps: [{ name: 'egon_fel_readback' }],
+  }, []), 'UBOOT_STAGE_FAIL');
+  // Anything else is a generic flow failure.
+  assert.equal(classifyFelSplUbootFailure({ ok: false, error: 'thunk write/exec failed', steps: [] }, []), 'FLOW_FAIL');
+  assert.equal(classifyFelSplUbootFailure(null, []), 'FLOW_FAIL');
+});
+
+test('v3.3: validateAutoCandidates detects nodram by label; a claimed nodram SHA-256 that does not match the data is refused', () => {
+  const checked = validateAutoCandidates([autoCandidate('nodram-test'), autoCandidate('336+3650393')]);
+  assert.equal(checked.ok, true);
+  assert.equal(checked.items.length, 2);
+  assert.equal(checked.items[0].nodram, true, 'label containing nodram');
+  assert.equal(checked.items[1].nodram, false);
+  assert.equal(checked.items[0].validated.spl_len, 24576);
+  assert.equal(checked.items[0].validated.uboot_load, 0x4a000000);
+  // The real nodram SHA-256 is recognised even with a neutral label.
+  const bySha = validateAutoCandidates([autoCandidate('test-a', { sha256: NODRAM_SHA256 })]);
+  // (sha mismatch is expected here: the test image is not the real
+  // nodram file — the point is the sha check runs before nodram
+  // detection, so a wrong sha is refused, never silently accepted.)
+  assert.equal(bySha.ok, false);
+  assert.equal(bySha.error, 'sha256_mismatch');
+});
+
+test('v3.3: validateAutoCandidates refuses empty, too many, bad-SHA and bad-image candidates before any device access', () => {
+  assert.equal(validateAutoCandidates([]).error, 'no_candidates');
+  assert.equal(validateAutoCandidates(null).error, 'no_candidates');
+  const five = validateAutoCandidates([1, 2, 3, 4, 5].map((i) => autoCandidate(`c${i}`)));
+  assert.equal(five.ok, false);
+  assert.equal(five.error, 'too_many_candidates');
+  const badSha = validateAutoCandidates([autoCandidate('c1', { sha256: '00'.repeat(32) })]);
+  assert.equal(badSha.ok, false);
+  assert.equal(badSha.error, 'sha256_mismatch');
+  const badEgon = makeValidUbootImage();
+  badEgon.write('XXXX.BT0', 4, 'latin1');
+  const bad = validateAutoCandidates([{
+    label: 'bad', base64: Buffer.from(badEgon).toString('base64'),
+    sha256: crypto.createHash('sha256').update(badEgon).digest('hex'),
+  }]);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error, 'bad_egon');
+});
+
+test('v3.3: runFelAuto simulated run — candidate 1 fails at eGON read-back, diagnostics run, candidate 2 boots', async () => {
+  const runner = makeStubRunner({ validate: ['ok', 'ok'], flow: ['egon', 'ok'], felVersionOk: false });
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['336-clk', '300-clk']),
+    runner, sleepMs: 0,
+  });
+  assert.equal(run.outcome, 'BOOT_SUCCESS');
+  assert.equal(run.ok, true);
+  assert.equal(run.candidates.length, 2);
+  assert.equal(run.candidates[0].status, 'FAILED');
+  assert.equal(run.candidates[0].failureKind, 'EGON_READBACK_FAIL');
+  assert.ok(run.candidates[0].diagnostics, 'diagnostics must be recorded on the failed candidate');
+  assert.equal(run.candidates[0].diagnostics.felVersionAttempts.length, 3, 'FEL_VERSION x3');
+  assert.equal(run.candidates[0].diagnostics.pattern.match, true, 'pattern write/read-back ran');
+  assert.equal(run.candidates[0].diagnostics.probe.ok, true, 'usb_probe ran');
+  assert.equal(run.candidates[1].status, 'BOOT_SUCCESS');
+  assert.equal(runner.calls.validateOnly, 2);
+  assert.equal(runner.calls.fullFlow, 2);
+  assert.equal(runner.calls.felVersion, 3, 'diagnostics FEL_VERSION x3, once');
+  assert.equal(runner.calls.patternTest, 1);
+  assert.equal(runner.calls.usbProbe, 1);
+  assert.ok(run.logLines.length > 0);
+});
+
+test('v3.3: runFelAuto simulated run — validate-only dies at step 4 (NEED_REENTRY), candidate 2 is never attempted', async () => {
+  const runner = makeStubRunner({ validate: ['need_reentry', 'ok'], flow: ['ok', 'ok'], felVersionOk: false });
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['nodram-test', '336+3650393']),
+    runner, sleepMs: 0,
+  });
+  assert.equal(run.outcome, 'NEED_REENTRY');
+  assert.equal(run.ok, false);
+  assert.match(run.outcomeDetail, /Re-enter FEL/);
+  assert.equal(run.candidates.length, 1, 'run stops after the first candidate');
+  assert.equal(run.candidates[0].status, 'NEED_REENTRY');
+  assert.equal(runner.calls.validateOnly, 1, 'candidate 2 validate-only must never run');
+  assert.equal(runner.calls.fullFlow, 0, 'no full flow against a dead FEL');
+  assert.equal(runner.calls.felVersion, 3, 'diagnostics confirm FEL is dead');
+});
+
+test('v3.3: runFelAuto simulated run — nodram candidate reads eGON.FEL back but DRAM staging fails as expected', async () => {
+  const runner = makeStubRunner({ validate: ['ok'], flow: ['uboot_stage'], felVersionOk: false });
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['nodram-test']),
+    runner, sleepMs: 0,
+  });
+  assert.equal(run.outcome, 'EXPECTED_UBOOT_STAGE_FAIL');
+  assert.equal(run.ok, false);
+  assert.equal(run.candidates[0].status, 'EXPECTED_UBOOT_STAGE_FAIL');
+  assert.equal(run.candidates[0].failureKind, 'UBOOT_STAGE_FAIL');
+  assert.equal(runner.calls.patternTest, 0, 'no diagnostics needed: eGON.FEL already proved FEL stayed alive');
+  assert.match(run.outcomeDetail, /DRAM init was not killing FEL/);
+});
+
+test('v3.3: runFelAuto simulated run — every candidate fails at eGON read-back, outcome is EXHAUSTED', async () => {
+  const runner = makeStubRunner({ validate: ['ok', 'ok'], flow: ['egon', 'egon'], felVersionOk: true });
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['336-clk', '300-clk']),
+    runner, sleepMs: 0,
+  });
+  assert.equal(run.outcome, 'EXHAUSTED');
+  assert.equal(run.ok, false);
+  assert.equal(run.candidates.length, 2);
+  assert.equal(runner.calls.validateOnly, 2);
+  assert.equal(runner.calls.fullFlow, 2);
+  assert.equal(runner.calls.felVersion, 6, 'diagnostics after each failed candidate');
+});
+
+test('v3.3: runFelAuto stops between candidates when the user presses Stop', async () => {
+  const runner = makeStubRunner({ validate: ['ok', 'ok'], flow: ['egon', 'ok'], felVersionOk: false });
+  let stop = false;
+  const run = await runFelAuto({
+    device: '/dev/bus/usb/001/002',
+    candidates: checkedCandidates(['336-clk', '300-clk']),
+    runner, sleepMs: 0,
+    isStopped: () => stop,
+    onEvent: (e) => { if (e.type === 'candidate_result') stop = true; },
+  });
+  assert.equal(run.outcome, 'STOPPED');
+  assert.equal(run.candidates.length, 1, 'second candidate must not start after Stop');
+  assert.equal(runner.calls.validateOnly, 1);
+});
+
+test('v3.3: fel-auto endpoint rejects missing confirm, bad SHA-256, empty and too-many candidates with 400, before any device access', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const noConfirm = await post(base, '/api/bridge/fel-auto', { device: DEV, candidates: [autoCandidate('c1')] });
+    assert.equal(noConfirm.status, 400);
+    assert.equal(noConfirm.body.error, 'confirm_required');
+    const badSha = await post(base, '/api/bridge/fel-auto', { device: DEV, confirm: true, candidates: [autoCandidate('c1', { sha256: '00'.repeat(32) })] });
+    assert.equal(badSha.status, 400);
+    assert.equal(badSha.body.error, 'sha256_mismatch');
+    const empty = await post(base, '/api/bridge/fel-auto', { device: DEV, confirm: true, candidates: [] });
+    assert.equal(empty.status, 400);
+    assert.equal(empty.body.error, 'no_candidates');
+    const five = await post(base, '/api/bridge/fel-auto', {
+      device: DEV, confirm: true,
+      candidates: [1, 2, 3, 4, 5].map((i) => autoCandidate(`c${i}`)),
+    });
+    assert.equal(five.status, 400);
+    assert.equal(five.body.error, 'too_many_candidates');
+    const badEgon = makeValidUbootImage();
+    badEgon.write('XXXX.BT0', 4, 'latin1');
+    const bad = await post(base, '/api/bridge/fel-auto', {
+      device: DEV, confirm: true,
+      candidates: [{
+        label: 'bad', base64: Buffer.from(badEgon).toString('base64'),
+        sha256: crypto.createHash('sha256').update(badEgon).digest('hex'),
+      }],
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error, 'bad_egon');
+    const stopNoId = await post(base, '/api/bridge/fel-auto/stop', {});
+    assert.equal(stopNoId.status, 400);
+    assert.equal(stopNoId.body.error, 'invalid_run_id');
+    const stopOk = await post(base, '/api/bridge/fel-auto/stop', { runId: 'fel-auto-test-1' });
+    assert.equal(stopOk.status, 200);
+    assert.equal(stopOk.body.stopped, true);
+  } finally { await stop(server); }
+});
+
+test('v3.3: fel-auto endpoint in the VM stops with TRANSPORT_ERROR (termux-usb absent) and streams NDJSON ending in a final line', async () => {
+  const { server, base } = await startTestServer();
+  try {
+    const res = await fetch(`${base}/api/bridge/fel-auto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device: DEV, confirm: true, candidates: [autoCandidate('nodram-test')] }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /ndjson/);
+    const text = await res.text();
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.ok(lines.length >= 2, 'run_start + final at least');
+    assert.equal(lines[0].type, 'run_start');
+    const final = lines[lines.length - 1];
+    assert.equal(final.type, 'final');
+    assert.equal(final.outcome, 'TRANSPORT_ERROR', 'termux-usb is absent in the VM, so no candidate can run');
+    assert.equal(final.candidates.length, 1);
+    assert.equal(final.candidates[0].status, 'SKIPPED');
   } finally { await stop(server); }
 });
